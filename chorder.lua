@@ -53,9 +53,19 @@ local quantize = false
 local strum_steps = 0
 
 -- Strum type
-local STRUM_OPTS = {"up","down","up/down","down/up","random"}
+local STRUM_OPTS = {
+  "up","down","up/down","down/up","random",
+  "center-out","outside-in","bass-bounce","treble-bounce",
+  "random no-repeat first","random stable ends"
+}
 local strum_type = 1
-local strum_alt_flip = false
+
+-- Strum state (internal)
+local strum_state = {
+  alt_flip = false,      -- for modes 3/4
+  last_first = nil,      -- for mode 10/11
+  last_last  = nil       -- for mode 11
+}
 
 -- Quantize divisions (beats; 1 beat = quarter)
 local QUANT_DIV_OPTS = {"1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"}
@@ -633,50 +643,181 @@ local function reverse_inplace(t)
 end
 
 local function shuffle_inplace(t)
-  -- Correct Fisher–Yates
   for i = #t, 2, -1 do
     local j = math.random(1, i)
     t[i], t[j] = t[j], t[i]
   end
 end
 
-local function make_strum_order(count)
-  if not count or count < 2 then
-    -- handle 0/1 safely
-    local order = {}
-    for i = 1, (count or 0) do order[i] = i end
-    return order
+-- Returns (order_table, new_state)
+local function make_strum_order_pure(count, stype, state)
+  state = state or { alt_flip=false, last_first=nil, last_last=nil }
+
+  -- handle 0/1 safely
+  local order = {}
+  for i = 1, math.max(count or 0, 0) do order[i] = i end
+  if #order <= 1 then return order, state end
+
+  local function center_out(n)
+    -- ex: 1..5 -> 3,2,4,1,5 ; 1..4 -> 2,3,1,4
+    local seq = {}
+    local lo = math.floor((n+1)/2)
+    local hi = lo + 1
+    if n % 2 == 1 then
+      table.insert(seq, lo)
+      while (#seq < n) do
+        if hi <= n then table.insert(seq, hi) end
+        local left = lo - (#seq % 2 == 0 and 0 or 1)
+        if left >= 1 and #seq < n then table.insert(seq, left) end
+        hi = hi + 1
+      end
+    else
+      -- even: start at n/2, then n/2+1, then expand
+      local a, b = n/2, n/2 + 1
+      table.insert(seq, a); table.insert(seq, b)
+      local step = 1
+      while #seq < n do
+        local l = a - step
+        local r = b + step
+        if l >= 1 then table.insert(seq, l) end
+        if r <= n and #seq < n then table.insert(seq, r) end
+        step = step + 1
+      end
+    end
+    return seq
   end
 
-  local order = {}
-  for i = 1, count do order[i] = i end
+  local function outside_in(n)
+    -- ex: 1..5 -> 1,5,2,4,3
+    local seq = {}
+    local i, j = 1, n
+    while i <= j do
+      table.insert(seq, i)
+      if i ~= j then table.insert(seq, j) end
+      i = i + 1; j = j - 1
+    end
+    return seq
+  end
 
-  if     strum_type == 1 then
+  local function bass_bounce(n)
+    -- 1, n, 2, n-1, ...
+    return outside_in(n)
+  end
+
+  local function treble_bounce(n)
+    -- n, 1, n-1, 2, ...
+    local seq = outside_in(n)
+    reverse_inplace(seq)
+    return seq
+  end
+
+  local n = #order
+
+  if     stype == 1 then
     -- up
-    return order
-  elseif strum_type == 2 then
+    return order, state
+
+  elseif stype == 2 then
     -- down
     reverse_inplace(order)
-    return order
-  elseif strum_type == 3 then
-    -- alternate up/down
-    if strum_alt_flip then reverse_inplace(order) end
-    strum_alt_flip = not strum_alt_flip
-    return order
-  elseif strum_type == 4 then
-    -- alternate down/up
-    if not strum_alt_flip then reverse_inplace(order) end
-    strum_alt_flip = not strum_alt_flip
-    return order
-  elseif strum_type == 5 then
+    return order, state
+
+  elseif stype == 3 then
+    -- alternating up/down
+    if state.alt_flip then reverse_inplace(order) end
+    state.alt_flip = not state.alt_flip
+    return order, state
+
+  elseif stype == 4 then
+    -- alternating down/up
+    if not state.alt_flip then reverse_inplace(order) end
+    state.alt_flip = not state.alt_flip
+    return order, state
+
+  elseif stype == 5 then
     -- random
     shuffle_inplace(order)
-    return order
-  else
-    return order
+    state.last_first = order[1]
+    state.last_last  = order[#order]
+    return order, state
+
+  elseif stype == 6 then
+    -- center-out
+    local seq = center_out(n)
+    for k=1,n do order[k] = seq[k] end
+    state.last_first = order[1]
+    state.last_last  = order[#order]
+    return order, state
+
+  elseif stype == 7 then
+    -- outside-in
+    local seq = outside_in(n)
+    for k=1,n do order[k] = seq[k] end
+    state.last_first = order[1]
+    state.last_last  = order[#order]
+    return order, state
+
+  elseif stype == 8 then
+    -- bass-bounce
+    local seq = bass_bounce(n)
+    for k=1,n do order[k] = seq[k] end
+    state.last_first = order[1]
+    state.last_last  = order[#order]
+    return order, state
+
+  elseif stype == 9 then
+    -- treble-bounce
+    local seq = treble_bounce(n)
+    for k=1,n do order[k] = seq[k] end
+    state.last_first = order[1]
+    state.last_last  = order[#order]
+    return order, state
+
+  elseif stype == 10 then
+    -- random no-repeat first
+    local tries = 0
+    repeat
+      shuffle_inplace(order)
+      tries = tries + 1
+    until (order[1] ~= state.last_first) or tries > 8
+    state.last_first = order[1]
+    state.last_last  = order[#order]
+    return order, state
+
+  elseif stype == 11 then
+    -- random stable ends: keep first/last from prior, shuffle middle
+    if state.last_first and state.last_last and n >= 3 then
+      -- build a middle pool excluding the desired ends; if ends collide, fallback
+      local middle = {}
+      for i=1,n do
+        if i ~= state.last_first and i ~= state.last_last then middle[#middle+1] = i end
+      end
+      if #middle >= (n-2) then
+        shuffle_inplace(middle)
+        local out = {}
+        out[1] = state.last_first
+        for i=1,#middle do out[#out+1] = middle[i] end
+        out[#out+1] = state.last_last
+        return out, state
+      end
+    end
+    -- first-time fallback: just random, but record ends
+    shuffle_inplace(order)
+    state.last_first = order[1]
+    state.last_last  = order[#order]
+    return order, state
   end
+
+  -- default fallback
+  return order, state
 end
 
+-- Thin wrapper to preserve your existing call sites
+local function make_strum_order(count)
+  local ord, ns = make_strum_order_pure(count, strum_type, strum_state)
+  strum_state = ns
+  return ord
+end
 
 -- ===== Output mode =====
 local OUT_MODE_PARAM = "chorder_out_mode"
@@ -819,20 +960,22 @@ local function draw_output_page()
   local out_mode = OUT_OPTS[params:get(OUT_MODE_PARAM) or 1] or "?"
   local out_idx = params:get(MIDI_OUT_DEV_PARAM) or 1
   local out_lbl = midi_devices[out_idx] or "—"
-  local mo_ch = tostring(params:get(MIDI_OUT_CH_PARAM) or 1)
-  local mi_i = params:get(MIDI_IN_DEV_PARAM) or 1
-  local mi_lbl = midi_in_devices[mi_i] or "none"
+  local mo_ch   = tostring(params:get(MIDI_OUT_CH_PARAM) or 1)
+
+  local mi_i    = params:get(MIDI_IN_DEV_PARAM) or 1
+  local mi_lbl  = midi_in_devices[mi_i] or "none"
   local ch_in_idx = params:get(MIDI_IN_CH_PARAM) or 1
   local ch_in_disp = (ch_in_idx==1) and "Omni" or ("Ch"..tostring(ch_in_idx-1))
-  draw_line(52, "MIDI In:", ellipsize(mi_lbl, 18) .. "  " .. ch_in_disp)
+
   local gate_txt = MIDI_GATE_OPTS[(params:get(MIDI_GATE_PARAM) or 1)] or "?"
   local bpm = string.format("%d BPM", math.floor(clock.get_tempo() or 120))
 
   draw_line(28, "Output:", out_mode)
   draw_line(40, "MIDI Out:", ellipsize(out_lbl, 18) .. "  Ch"..mo_ch)
-  draw_line(52, "MIDI In:", ellipsize(mi_nm, 14) .. "  "..ch_in_disp)
+  draw_line(52, "MIDI In:",  ellipsize(mi_lbl, 18) .. "  " .. ch_in_disp)
   screen.level(10); screen.move(4, 64); screen.text("Gate: "..gate_txt.."   Tempo "..bpm)
 end
+
 
 local function draw_chord_page()
   draw_header("Chord")
@@ -950,7 +1093,13 @@ function init()
 
   -- 17 strum type
   params:add_option("chorder_strum_type", "strum type", STRUM_OPTS, strum_type)
-  params:set_action("chorder_strum_type", function(i) strum_type = i; redraw() end)
+  params:set_action("chorder_strum_type", function(i)
+    strum_type = i
+    -- reset state so alternating/random-stable behave predictably after change
+    strum_state = { alt_flip=false, last_first=nil, last_last=nil }
+    redraw()
+  end)
+
 
   -- 18..19 humanize
   params:add_number("chorder_hum_steps", "humanize timing (max steps)", 0, 4, humanize_steps_max)
