@@ -674,6 +674,14 @@ local function setup_midi_in(param_index)
   print("MIDI IN: connected to "..(midi_in_names[param_index] or ("port "..(param_index-1))))
 end
 
+local function rebind_midi_in_if_needed()
+  -- If m is missing or its event handler has been wiped, rebind to current param
+  if (m == nil) or (m.event == nil) then
+    local cur = params:get(MIDI_IN_DEV_PARAM) or 1
+    setup_midi_in(cur)
+  end
+end
+
 local function rebuild_midi_lists(keep_in, keep_out)
   local old_in = nil
   local cur_in = params:get(MIDI_IN_DEV_PARAM); if cur_in > 1 then old_in = midi_in_names[cur_in] end
@@ -767,6 +775,7 @@ function init()
   params:set_action(OUT_MODE_PARAM, function(_)
     if mx and mx.all_notes_off then pcall(function() mx:all_notes_off() end) end
     all_midi_notes_off()
+    rebind_midi_in_if_needed() -- <—— ADD THIS
     redraw()
   end)
 
@@ -858,6 +867,7 @@ function init()
   params:set_action(MIDI_OUT_DEV_PARAM, function(i)
     all_midi_notes_off()
     setup_midi_out_awake(i)
+    rebind_midi_in_if_needed() -- <—— ADD THIS
     redraw()
   end)
 
@@ -866,6 +876,7 @@ function init()
   params:set_action(MIDI_OUT_CH_PARAM, function(idx)
     midi_channel = idx
     all_midi_notes_off()
+    rebind_midi_in_if_needed() -- <—— ADD THIS
     redraw()
   end)
 
@@ -881,8 +892,9 @@ function init()
   clock.run(clock_loop)
 
   ensure_selected_loaded()
-  setup_midi_in(default_midi_in_index)
   setup_midi_out_awake(1)
+  setup_midi_in(params:get(MIDI_IN_DEV_PARAM) or default_midi_in_index) -- ensure param-selected value wins
+  rebind_midi_in_if_needed() -- <—— ADD THIS as a final safety
   redraw()
 end
 
