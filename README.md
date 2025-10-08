@@ -3,7 +3,17 @@ A chord instrument with assignable modifiers for Monome Norns.
 
 -   Diatonic chords on white keys (I–VII), in any key/scale.
 -   Voicings:
-    -   None, Drop-2, Drop-3, Drop-2&4, Drop-1, Open position, Wide spread, Quartal, Quintal, Nearest voice leading, Smooth inversion
+    -   None
+    -   Drop-2: second note from top down an octave
+    -   Drop-3: third note from top down an octave
+    -   Drop-2&4: 2nd and 4th from top down an octave
+    -   Drop-1: Top note down one octave
+    -   Open position: Keep at least a 5th between any adjacent notes
+    -   Wide spread: Move 3rd and 5th up an octave
+    -   Quartal: Rebuild chord in stacked 4ths from root
+    -   Quintal: Rebuild chord in stacked 5ths from root
+    -   Nearest voice leading: Each note moves by ≤ interval threshold (e.g., ≤5 semitones) to next chord
+    -   Smooth inversion: Auto-select inversion minimizing total motion from previous
 -   Timing & feel: global-clock aware quantize, strum (per-division steps), swing (grid/% modes), humanize (time/velocity)
 -   Output:
     -   [mx.samples](https://github.com/schollz/mx.samples), MIDI, or both
