@@ -623,17 +623,60 @@ end
 
 local function jitter_steps(max_steps) if max_steps <= 0 then return 0 end; return math.random(0, max_steps) end
 local function jitter_velocity(vel, range) if range <= 0 then return vel end; local d = math.random(-range, range); return util.clamp(vel + d, 1, 127) end
-local function reverse_inplace(t) local i, j = 1, #t; while i < j do t[i], t[j] = t[j], t[i]; i = i + 1; j = j - 1 end end
-local function shuffle_inplace(t) for i = #t, 2, 1 do local j = math.random(1, i); t[i], t[j] = t[j], t[i] end end
-local function make_strum_order(count)
-  local order = {}; for i=1,count do order[i]=i end
-  if strum_type == 1 then return order
-  elseif strum_type == 2 then reverse_inplace(order); return order
-  elseif strum_type == 3 then if strum_alt_flip then reverse_inplace(order) end; strum_alt_flip = not strum_alt_flip; return order
-  elseif strum_type == 4 then if not strum_alt_flip then reverse_inplace(order) end; strum_alt_flip = not strum_alt_flip; return order
-  elseif strum_type == 5 then shuffle_inplace(order); return order end
-  return order
+local function reverse_inplace(t)
+  local i, j = 1, #t
+  while i < j do
+    t[i], t[j] = t[j], t[i]
+    i = i + 1
+    j = j - 1
+  end
 end
+
+local function shuffle_inplace(t)
+  -- Correct Fisher–Yates
+  for i = #t, 2, -1 do
+    local j = math.random(1, i)
+    t[i], t[j] = t[j], t[i]
+  end
+end
+
+local function make_strum_order(count)
+  if not count or count < 2 then
+    -- handle 0/1 safely
+    local order = {}
+    for i = 1, (count or 0) do order[i] = i end
+    return order
+  end
+
+  local order = {}
+  for i = 1, count do order[i] = i end
+
+  if     strum_type == 1 then
+    -- up
+    return order
+  elseif strum_type == 2 then
+    -- down
+    reverse_inplace(order)
+    return order
+  elseif strum_type == 3 then
+    -- alternate up/down
+    if strum_alt_flip then reverse_inplace(order) end
+    strum_alt_flip = not strum_alt_flip
+    return order
+  elseif strum_type == 4 then
+    -- alternate down/up
+    if not strum_alt_flip then reverse_inplace(order) end
+    strum_alt_flip = not strum_alt_flip
+    return order
+  elseif strum_type == 5 then
+    -- random
+    shuffle_inplace(order)
+    return order
+  else
+    return order
+  end
+end
+
 
 -- ===== Output mode =====
 local OUT_MODE_PARAM = "chorder_out_mode"
