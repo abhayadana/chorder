@@ -563,17 +563,64 @@ end
 
 -- ===== MIDI In =====
 local m = nil
-local midi_in_names = {"none"}
+local midi_in_devices = {"none"}        -- display list (e.g., "1: LchkyMini")
+local midi_in_ports_map = { [1] = 0 }   -- display index -> vport index (0 = none)
 local MIDI_IN_DEV_PARAM = "chorder_midi_in_dev"
 local MIDI_IN_CH_PARAM  = "chorder_midi_in_ch"
 
-local function build_midi_in_names()
-  local names = {"none"}
-  for i = 1, #midi.vports do names[#names+1] = midi.vports[i].name or ("dev "..i) end
-  return names
+local function build_midi_in_device_list_awake()
+  midi_in_devices = {"none"}
+  midi_in_ports_map = { [1] = 0 }
+  for i = 1, #midi.vports do
+    local long_name  = midi.vports[i].name or ("dev "..i)
+    local short_name = (#long_name > 15) and util.acronym(long_name) or long_name
+    table.insert(midi_in_devices, (i..": "..short_name))
+    midi_in_ports_map[#midi_in_devices] = i
+  end
+  if #midi_in_devices == 1 then
+    -- no devices; leave just "none"
+  end
 end
 
 local function teardown_midi_in() if m then m.event = nil; m = nil end end
+
+local function setup_midi_in(param_index)
+  teardown_midi_in()
+  local port = midi_in_ports_map[param_index] or 0
+  if port == 0 then print("MIDI IN: no input selected"); return end
+
+  m = midi.connect(port)
+  if not m then
+    print("MIDI IN: connect failed for port "..port)
+    return
+  end
+
+  m.event = function(data)
+    local msg = midi.to_msg(data); if not msg then return end
+    local ch_sel_idx = params:get(MIDI_IN_CH_PARAM)
+    if ch_sel_idx ~= 1 then
+      local want_ch = ch_sel_idx - 1
+      if msg.ch ~= want_ch then return end
+    end
+
+    local canon = canonical_names[voice_index] or ""
+    local vel = (velocity_mode == 2 and (msg.vel or fixed_velocity) or fixed_velocity)
+
+    if msg.type == "note_on" and msg.vel > 0 then
+      ensure_selected_loaded()
+      local pc = msg.note % 12
+      if WHITE_SET[pc] then handle_note_on(canon, msg.note, vel, WHITE_TO_DEG[pc]) end
+      redraw()
+    elseif (msg.type == "note_off") or (msg.type == "note_on" and msg.vel == 0) then
+      local pc = msg.note % 12
+      if WHITE_SET[pc] then handle_note_off(canon, msg.note) end
+      redraw()
+    end
+  end
+
+  print("MIDI IN: connected to "..(midi_in_devices[param_index] or ("port "..port)))
+end
+
 local function jitter_steps(max_steps) if max_steps <= 0 then return 0 end; return math.random(0, max_steps) end
 local function jitter_velocity(vel, range) if range <= 0 then return vel end; local d = math.random(-range, range); return util.clamp(vel + d, 1, 127) end
 local function reverse_inplace(t) local i, j = 1, #t; while i < j do t[i], t[j] = t[j], t[i]; i = i + 1; j = j - 1 end end
@@ -671,7 +718,7 @@ local function setup_midi_in(param_index)
     end
   end
 
-  print("MIDI IN: connected to "..(midi_in_names[param_index] or ("port "..(param_index-1))))
+  print("MIDI IN: connected to "..(midi_in_devices[param_index] or ("port "..(param_index-1))))
 end
 
 local function rebind_midi_in_if_needed()
@@ -683,17 +730,37 @@ local function rebind_midi_in_if_needed()
 end
 
 local function rebuild_midi_lists(keep_in, keep_out)
-  local old_in = nil
-  local cur_in = params:get(MIDI_IN_DEV_PARAM); if cur_in > 1 then old_in = midi_in_names[cur_in] end
-
-  build_midi_device_list_awake()
-  midi_in_names = build_midi_in_names()
-
-  params:hide(MIDI_IN_DEV_PARAM); params:unhide(MIDI_IN_DEV_PARAM); params:param_changed(MIDI_IN_DEV_PARAM)
-  if keep_in and old_in then
-    for i,nm in ipairs(midi_in_names) do
-      if nm == old_in then params:set(MIDI_IN_DEV_PARAM, i); setup_midi_in(i); break end
+  -- remember current MIDI IN long name (so we can re-select reliably)
+  local remembered_in_long = nil
+  do
+    local cur_idx = params:get(MIDI_IN_DEV_PARAM) or 1
+    local vp = midi_in_ports_map[cur_idx]
+    if vp and vp > 0 and midi.vports[vp] then
+      remembered_in_long = midi.vports[vp].name
     end
+  end
+
+  build_midi_device_list_awake()   -- outputs (unchanged)
+  build_midi_in_device_list_awake()-- inputs (short names)
+
+  -- refresh IN param options to new short list
+  params:hide(MIDI_IN_DEV_PARAM); params:unhide(MIDI_IN_DEV_PARAM)
+  local p_in = params:lookup_param(MIDI_IN_DEV_PARAM)
+  if p_in then
+    p_in.options = midi_in_devices
+    p_in.count = #midi_in_devices
+  end
+
+  if keep_in and remembered_in_long then
+    local idx = 1
+    for i = 2, #midi_in_devices do
+      local vp = midi_in_ports_map[i]
+      if vp and midi.vports[vp] and midi.vports[vp].name == remembered_in_long then
+        idx = i; break
+      end
+    end
+    params:set(MIDI_IN_DEV_PARAM, idx)
+    setup_midi_in(idx)
   end
 end
 
@@ -711,9 +778,10 @@ local function draw_output_page()
   local out_lbl = midi_devices[out_idx] or "—"
   local mo_ch = tostring(params:get(MIDI_OUT_CH_PARAM) or 1)
   local mi_i = params:get(MIDI_IN_DEV_PARAM) or 1
-  local mi_nm = (mi_i>1 and midi.vports[mi_i-1] and midi.vports[mi_i-1].name) or "none"
+  local mi_lbl = midi_in_devices[mi_i] or "none"
   local ch_in_idx = params:get(MIDI_IN_CH_PARAM) or 1
   local ch_in_disp = (ch_in_idx==1) and "Omni" or ("Ch"..tostring(ch_in_idx-1))
+  draw_line(52, "MIDI In:", ellipsize(mi_lbl, 18) .. "  " .. ch_in_disp)
   local gate_txt = MIDI_GATE_OPTS[(params:get(MIDI_GATE_PARAM) or 1)] or "?"
   local bpm = string.format("%d BPM", math.floor(clock.get_tempo() or 120))
 
@@ -854,11 +922,24 @@ function init()
   params:set_action("chorder_swing_pct", function(v) swing_percent = util.clamp(v, 0, 75); redraw() end)
 
   -- 22..23 MIDI IN
-  midi_in_names = build_midi_in_names()
-  local default_midi_in_index = 1
-  for i,nm in ipairs(midi_in_names) do if nm == DEFAULT_MIDI_IN_NAME then default_midi_in_index = i; break end end
-  params:add_option(MIDI_IN_DEV_PARAM, "MIDI input", midi_in_names, default_midi_in_index)
+  build_midi_in_device_list_awake()
+
+  -- find default by matching LONG name to an entry's underlying port name
+  local function default_midi_in_index_from_long(long_name)
+    if not long_name or long_name == "" then return 1 end
+    for i = 2, #midi_in_devices do
+      local vp = midi_in_ports_map[i]
+      local ln = midi.vports[vp] and midi.vports[vp].name
+      if ln == long_name then return i end
+    end
+    return 1
+  end
+
+  local default_midi_in_index = default_midi_in_index_from_long(DEFAULT_MIDI_IN_NAME)
+
+  params:add_option(MIDI_IN_DEV_PARAM, "MIDI input", midi_in_devices, default_midi_in_index)
   params:set_action(MIDI_IN_DEV_PARAM, function(i) setup_midi_in(i) end)
+
   local ch_opts_in = {"omni"}; for i=1,16 do ch_opts_in[#ch_opts_in+1]=tostring(i) end
   params:add_option(MIDI_IN_CH_PARAM, "MIDI input channel", ch_opts_in, 1)
 
