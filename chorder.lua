@@ -1,17 +1,9 @@
--- Chorder - a chord instrument
--- Output: mx.samples and/or MIDI
+-- CHORDER - a chord instrument
+-- @abhayadana
+--
+-- Out: mx.samples and/or MIDI
 -- Diatonic chords on white keys
 -- Long-press K3 for chord HUD
---
--- Free Play:
---  - White keys map to diatonic degrees of the selected key/scale (like chords)
---  - Separate MIDI input channel; incoming velocity
---  - Optional octave transpose
---  - Own mx.samples + MIDI routing
---
--- UI:
---  - Compact Output page
---  - Chord page + HUD show currently held Free Play notes
 
 engine.name = "MxSamples"
 
@@ -107,7 +99,7 @@ local loaded_set = {}
 -- UI: chord banner
 local last_chord_name = nil
 local last_name_time = 0
-local last_name_timeout = 2.0
+local last_name_timeout = 2.0 -- kept hardcoded by request
 
 -- ===== utils =====
 local function trim(s) return (s and s:gsub("^%s*(.-)%s*$", "%1")) or "" end
@@ -131,7 +123,7 @@ end
 -- UI helpers
 local function ellipsize(s, max_chars) s = tostring(s or ""); if #s <= max_chars then return s end; return s:sub(1, math.max(0, max_chars - 1)) .. "…" end
 local function draw_header(active_label)
-  screen.level(15); screen.move(4, 12); screen.text("Chorder")
+  screen.level(15); screen.move(4, 12); screen.text("CHORDER")
   screen.level(10); screen.move(124, 12); if active_label then screen.text_right("["..active_label.."]") end
 end
 local function draw_line(y, label, value)
@@ -272,10 +264,9 @@ local function midi_out_on_awake(note, vel127)
   active_note_on(n)
 end
 
--- Gate metro
+-- Per-note MIDI gate timing (replaces single metro approach)
 local MIDI_GATE_PARAM = "chorder_midi_gate"
 local MIDI_GATE_OPTS = {"release","25%","50%","75%","100%"}
-local midi_gate_metro = metro.init()
 local function compute_gate_seconds()
   local sel = params:get(MIDI_GATE_PARAM) or 1
   if sel == 1 then return nil end
@@ -283,10 +274,17 @@ local function compute_gate_seconds()
   local bpm = clock.get_tempo()
   return (60 / bpm) * (tick_div or 1/4) * frac
 end
-midi_gate_metro.event = function() all_midi_notes_off() end
-local function schedule_gate_if_needed()
+local function schedule_gate_for_note(note)
   local secs = compute_gate_seconds()
-  if secs and secs > 0 then midi_gate_metro:start(secs, 1) end
+  if not secs or secs <= 0 then return end
+  local n = util.clamp(note, 0, 127)
+  clock.run(function()
+    clock.sleep(secs)
+    if active_notes[n] then
+      pcall(function() mout:note_off(n, 0, midi_channel) end)
+      active_note_off(n)
+    end
+  end)
 end
 
 -- ===== chord math =====
@@ -602,7 +600,7 @@ local FREE_MIDI_OUT_DEV_PARAM = "free_midi_out_dev"
 local FREE_MIDI_OUT_CH_PARAM  = "free_midi_out_ch"
 local free_midi_channel = 1
 
-local FREE_MIDI_IN_CH_PARAM = "free_midi_in_ch" -- 1..16 (explicit)
+local FREE_MIDI_IN_CH_PARAM = "free_midi_in_ch" -- 1..16 (explicit); default 2 per request
 local free_transpose_oct = 0 -- octave transpose
 
 local free_active_map = {}  -- [incoming_note] = quantized/transposed note
@@ -724,10 +722,10 @@ local function setup_midi_in(param_index)
       else chord_ok = (msg.ch == (ch_sel_idx - 1)) end
     end
 
-    -- free play input channel (explicit 1..16)
+    -- free play input channel (explicit 1..16; default 2)
     local free_ok = false
     do
-      local free_ch = params:get(FREE_MIDI_IN_CH_PARAM) or 1
+      local free_ch = params:get(FREE_MIDI_IN_CH_PARAM) or 2
       free_ok = (msg.ch == free_ch)
     end
 
@@ -745,7 +743,7 @@ local function setup_midi_in(param_index)
         end
       end
 
-      -- FREE PLAY (white keys -> diatonic scale degrees, nearest to octave, then transpose)
+      -- FREE PLAY (white keys -> diatonic degree nearest to register, then transpose)
       if free_enable and free_ok then
         local pc = msg.note % 12
         local deg = WHITE_TO_DEG[pc]
@@ -808,7 +806,7 @@ local function rebuild_midi_lists(keep_in, keep_out)
   build_midi_in_device_list_awake()-- inputs
 
   -- refresh IN param options
-  params:hide(MIDI_IN_DEV_PARAM); params:unhide(MIDI_IN_DEV_PARAM)
+  params:hide(MIDI_IN_DEV_PARAM);  params:show(MIDI_IN_DEV_PARAM)
   local p_in = params:lookup_param(MIDI_IN_DEV_PARAM)
   if p_in then
     p_in.options = midi_in_devices
@@ -816,7 +814,7 @@ local function rebuild_midi_lists(keep_in, keep_out)
   end
 
   -- refresh primary MIDI OUT device options
-  params:hide(MIDI_OUT_DEV_PARAM); params:unhide(MIDI_OUT_DEV_PARAM)
+  params:hide(MIDI_OUT_DEV_PARAM); params:show(MIDI_OUT_DEV_PARAM)
   local p_out = params:lookup_param(MIDI_OUT_DEV_PARAM)
   if p_out then
     p_out.options = midi_devices
@@ -824,7 +822,7 @@ local function rebuild_midi_lists(keep_in, keep_out)
   end
 
   -- refresh FREE PLAY MIDI OUT device options
-  params:hide(FREE_MIDI_OUT_DEV_PARAM); params:unhide(FREE_MIDI_OUT_DEV_PARAM)
+  params:hide(FREE_MIDI_OUT_DEV_PARAM); params:show(FREE_MIDI_OUT_DEV_PARAM)
   local p_free_out = params:lookup_param(FREE_MIDI_OUT_DEV_PARAM)
   if p_free_out then
     p_free_out.options = midi_devices
@@ -952,7 +950,7 @@ local function fanout_note_on(canon, note, vel)
   if want_mx()   then mx_on_safe(canon, note, vel) end
   if want_midi() then
     midi_out_on_awake(note, vel)
-    schedule_gate_if_needed()
+    schedule_gate_for_note(note) -- per-note gate
   end
 end
 
@@ -1029,10 +1027,10 @@ local function draw_output_page()
   local free_dev_i  = params:get(FREE_MIDI_OUT_DEV_PARAM) or 1
   local free_dev    = ellipsize(midi_devices[free_dev_i] or "—", 12)
   local free_ch     = tostring(params:get(FREE_MIDI_OUT_CH_PARAM) or 1)
-  local free_in_ch  = tostring(params:get(FREE_MIDI_IN_CH_PARAM) or 1)
+  local free_in_ch  = tostring(params:get(FREE_MIDI_IN_CH_PARAM) or 2)
 
   -- Row 1: Chord Out
-  screen.level(12); screen.move(4, 22); screen.text("Chord Out:")
+  screen.level(12); screen.move(4, 22); screen.text("Out:")
   screen.level(15); screen.move(124,22)
   if out_mode_short == "MIDI" or out_mode_short == "mx+M" then
     screen.text_right(out_mode_short.." | "..out_lbl.." / Ch"..mo_ch)
@@ -1041,7 +1039,7 @@ local function draw_output_page()
   end
 
   -- Row 2: Chord In
-  screen.level(12); screen.move(4, 34); screen.text("Chord In:")
+  screen.level(12); screen.move(4, 34); screen.text("In:")
   screen.level(15); screen.move(124,34); screen.text_right(mi_lbl.." / "..ch_in_disp)
 
   -- Row 3: Free
@@ -1116,28 +1114,79 @@ function redraw()
 end
 
 -- ===== lifecycle =====
+
+-- helper to hide/show
+local function show_param(id, show)
+  if show then params:show(id) else params:hide(id) end
+end
+
 function init()
   mx = mxsamples:new()
   scan_instruments()
   build_midi_device_list_awake()
 
-  -- param group size must match count below
-  local n = 33 -- 26 base + 6 free play + 1 transpose
-  params:add_group("CHORDER", n)
+  -------------------------------------------------------------------
+  -- Groups & Params (counts must match)
+  -------------------------------------------------------------------
 
-  -- 1 output mode
+  -- 1) CHORDER · I/O & Devices (6)
+  params:add_group("CHORDER · I/O & Devices", 6)
+
+  -- output
   params:add_option(OUT_MODE_PARAM, "output", OUT_OPTS, 1)
   params:set_action(OUT_MODE_PARAM, function(_)
+    -- autohide MIDI gate unless output includes MIDI
+    local includes_midi = want_midi()
+    show_param(MIDI_GATE_PARAM, includes_midi)
     panic_all_outputs()
     rebind_midi_in_if_needed()
     redraw()
   end)
 
-  -- 2 instrument
+  -- MIDI output device
+  params:add_option(MIDI_OUT_DEV_PARAM, "MIDI output", midi_devices, 1)
+  params:set_action(MIDI_OUT_DEV_PARAM, function(i)
+    panic_all_outputs()
+    setup_midi_out_awake(i)
+    rebind_midi_in_if_needed()
+    redraw()
+  end)
+
+  -- MIDI output channel
+  params:add_option(MIDI_OUT_CH_PARAM, "MIDI output channel", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
+  params:set_action(MIDI_OUT_CH_PARAM, function(idx)
+    midi_channel = idx
+    panic_all_outputs()
+    rebind_midi_in_if_needed()
+    redraw()
+  end)
+
+  -- MIDI gate (autohide if output excludes MIDI)
+  params:add_option(MIDI_GATE_PARAM, "MIDI gate", MIDI_GATE_OPTS, 1)
+
+  -- MIDI input (device)
+  build_midi_in_device_list_awake()
+  local function default_midi_in_index_from_long(long_name)
+    if not long_name or long_name == "" then return 1 end
+    for i = 2, #midi_in_devices do
+      local vp = midi_in_ports_map[i]
+      local ln = midi.vports[vp] and midi.vports[vp].name
+      if ln == long_name then return i end
+    end
+    return 1
+  end
+  local default_midi_in_index = default_midi_in_index_from_long(DEFAULT_MIDI_IN_NAME)
+  params:add_option(MIDI_IN_DEV_PARAM, "MIDI input", midi_in_devices, default_midi_in_index)
+  params:set_action(MIDI_IN_DEV_PARAM, function(i) setup_midi_in(i) end)
+
+  -- chord MIDI input channel (1=omni, else ch+1)
+  local ch_opts_in = {"omni"}; for i=1,16 do ch_opts_in[#ch_opts_in+1]=tostring(i) end
+  params:add_option(MIDI_IN_CH_PARAM, "chord MIDI input ch", ch_opts_in, 1)
+
+  -- 2) CHORDER · Instrument (mx.samples) (2)
+  params:add_group("CHORDER · Instrument (mx.samples)", 2)
   params:add_option("chorder_mx_voice", "mx.samples", (#display_names>0 and display_names or {"(no packs)"}), 1)
   params:set_action("chorder_mx_voice", function(i) voice_index = i; ensure_selected_loaded(); redraw() end)
-
-  -- 3 refresh
   params:add_trigger("chorder_refresh_voices", "refresh instrument list")
   params:set_action("chorder_refresh_voices", function()
     scan_instruments()
@@ -1157,7 +1206,8 @@ function init()
     redraw()
   end)
 
-  -- 4..6 key + mode
+  -- 3) CHORDER · Key & Scale (3)
+  params:add_group("CHORDER · Key & Scale", 3)
   params:add_option("chorder_root_pc", "root pitch", NOTE_NAMES_SHARP, root_pc+1)
   params:set_action("chorder_root_pc", function(i) root_pc = i-1; recompute_root_midi(); redraw() end)
   params:add_number("chorder_root_oct", "root octave", -1, 8, root_oct)
@@ -1165,137 +1215,102 @@ function init()
   params:add_option("chorder_scale", "scale/mode", SCALE_NAMES, 1)
   params:set_action("chorder_scale", function(i) scale_name = SCALE_NAMES[i] or "Major"; redraw() end)
 
-  -- 7..11 chord build
+  -- 4) CHORDER · Chord Build (5)
+  params:add_group("CHORDER · Chord Build", 5)
   params:add_option("chorder_seventh", "chord type", {"triad", "7th"}, 1)
   params:set_action("chorder_seventh", function(i) seventh_mode = (i==2); redraw() end)
   params:add_number("chorder_inversion", "inversion (0-3)", 0, 3, inversion)
   params:set_action("chorder_inversion", function(v) inversion = util.clamp(v,0,3); redraw() end)
   params:add_number("chorder_spread", "spread (semitones)", -24, 24, spread_semitones)
   params:set_action("chorder_spread", function(v) spread_semitones = util.round(v); redraw() end)
-
   local VOICE_OPTS = {
     "none","drop-2","drop-3","drop-2&4","drop-1",
     "open","wide","quartal","quintal","nearest","smooth"
   }
   params:add_option("chorder_voicing", "voicing", VOICE_OPTS, voicing_mode)
-  params:set_action("chorder_voicing", function(i) voicing_mode = i; redraw() end)
-
+  params:set_action("chorder_voicing", function(i)
+    voicing_mode = i
+    -- inversion hidden when voicing=smooth
+    show_param("chorder_inversion", voicing_mode ~= 11)
+    redraw()
+  end)
   params:add_option("chorder_bass_note", "add bass (root -12)", {"off","on"}, (add_bass and 2 or 1))
   params:set_action("chorder_bass_note", function(i) add_bass = (i==2); redraw() end)
 
-  -- 12..13 velocity (chord)
-  params:add_option("chorder_vel_mode", "velocity source (chord)", {"fixed","incoming"}, velocity_mode)
-  params:set_action("chorder_vel_mode", function(i) velocity_mode = i end)
-  params:add_number("chorder_vel_fixed", "fixed velocity (chord)", 1, 127, fixed_velocity)
-  params:set_action("chorder_vel_fixed", function(v) fixed_velocity = util.clamp(v,1,127) end)
-
-  -- 14..16 timing
+  -- 5) CHORDER · Timing & Feel (8)
+  params:add_group("CHORDER · Timing & Feel", 8)
   params:add_option("chorder_quantize", "quantize chords", {"off","on"}, (quantize and 2 or 1))
-  params:set_action("chorder_quantize", function(i) quantize = (i==2); redraw() end)
+  params:set_action("chorder_quantize", function(i)
+    quantize = (i==2)
+    show_param("chorder_quant_div", quantize)
+    redraw()
+  end)
   params:add_option("chorder_quant_div", "quantize division", QUANT_DIV_OPTS, 3)
-  params:set_action("chorder_quant_div", function(i) tick_div_str = QUANT_DIV_OPTS[i]; tick_div = QUANT_DIV_MAP[tick_div_str] or 1/4; redraw() end)
+  params:set_action("chorder_quant_div", function(i)
+    tick_div_str = QUANT_DIV_OPTS[i]; tick_div = QUANT_DIV_MAP[tick_div_str] or 1/4; redraw()
+  end)
   params:add_number("chorder_strum", "strum (steps of division)", 0, 8, strum_steps)
   params:set_action("chorder_strum", function(v) strum_steps = util.clamp(v,0,8); redraw() end)
-
-  -- 17 strum type
   params:add_option("chorder_strum_type", "strum type", STRUM_OPTS, strum_type)
   params:set_action("chorder_strum_type", function(i)
     strum_type = i
     strum_state = { alt_flip=false, last_first=nil, last_last=nil }
     redraw()
   end)
-
-  -- 18..19 humanize (chord)
+  params:add_option("chorder_swing_mode", "swing mode", {"grid","swing %"}, swing_mode)
+  params:set_action("chorder_swing_mode", function(i)
+    swing_mode = i
+    show_param("chorder_swing_pct", swing_mode == 2)
+    redraw()
+  end)
+  params:add_number("chorder_swing_pct", "swing %", 0, 75, swing_percent)
+  params:set_action("chorder_swing_pct", function(v) swing_percent = util.clamp(v, 0, 75); redraw() end)
   params:add_number("chorder_hum_steps", "humanize timing (max steps)", 0, 4, humanize_steps_max)
   params:set_action("chorder_hum_steps", function(v) humanize_steps_max = util.clamp(v,0,4); redraw() end)
   params:add_number("chorder_hum_vel", "humanize velocity (+/-)", 0, 30, humanize_vel_range)
   params:set_action("chorder_hum_vel", function(v) humanize_vel_range = util.clamp(v,0,30); redraw() end)
 
-  -- 20..21 swing
-  params:add_option("chorder_swing_mode", "swing mode", {"grid","swing %"}, swing_mode)
-  params:set_action("chorder_swing_mode", function(i) swing_mode = i; redraw() end)
-  params:add_number("chorder_swing_pct", "swing %", 0, 75, swing_percent)
-  params:set_action("chorder_swing_pct", function(v) swing_percent = util.clamp(v, 0, 75); redraw() end)
-
-  -- 22..23 MIDI IN (device + channel for chord voice)
-  build_midi_in_device_list_awake()
-  local function default_midi_in_index_from_long(long_name)
-    if not long_name or long_name == "" then return 1 end
-    for i = 2, #midi_in_devices do
-      local vp = midi_in_ports_map[i]
-      local ln = midi.vports[vp] and midi.vports[vp].name
-      if ln == long_name then return i end
-    end
-    return 1
-  end
-  local default_midi_in_index = default_midi_in_index_from_long(DEFAULT_MIDI_IN_NAME)
-
-  params:add_option(MIDI_IN_DEV_PARAM, "MIDI input", midi_in_devices, default_midi_in_index)
-  params:set_action(MIDI_IN_DEV_PARAM, function(i) setup_midi_in(i) end)
-
-  local ch_opts_in = {"omni"}; for i=1,16 do ch_opts_in[#ch_opts_in+1]=tostring(i) end
-  params:add_option(MIDI_IN_CH_PARAM, "chord MIDI input ch", ch_opts_in, 1)
-
-  -- 24 MIDI OUT device (chord)
-  params:add_option(MIDI_OUT_DEV_PARAM, "MIDI output", midi_devices, 1)
-  params:set_action(MIDI_OUT_DEV_PARAM, function(i)
-    panic_all_outputs()
-    setup_midi_out_awake(i)
-    rebind_midi_in_if_needed()
-    redraw()
+  -- 6) CHORDER · Velocity (Chord) (2)
+  params:add_group("CHORDER · Velocity (Chord)", 2)
+  params:add_option("chorder_vel_mode", "velocity src (chord)", {"fixed","incoming"}, velocity_mode)
+  params:set_action("chorder_vel_mode", function(i)
+    velocity_mode = i
+    show_param("chorder_vel_fixed", i==1)
   end)
+  params:add_number("chorder_vel_fixed", "fixed velocity (chord)", 1, 127, fixed_velocity)
+  params:set_action("chorder_vel_fixed", function(v) fixed_velocity = util.clamp(v,1,127) end)
 
-  -- 25 MIDI OUT channel (chord)
-  params:add_option(MIDI_OUT_CH_PARAM, "MIDI output channel", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
-  params:set_action(MIDI_OUT_CH_PARAM, function(idx)
-    midi_channel = idx
-    panic_all_outputs()
-    rebind_midi_in_if_needed()
-    redraw()
-  end)
-
-  -- 26 note length gate (chord MIDI)
-  params:add_option(MIDI_GATE_PARAM, "MIDI gate", MIDI_GATE_OPTS, 1)
-
-  -- ===== Free Play params (27..33) =====
+  -- 7) CHORDER · Free Play (7)  -- unswung / unhumanized by request
+  params:add_group("CHORDER · Free Play", 7)
   params:add_option("free_enable", "free play", {"off","on"}, 1)
   params:set_action("free_enable", function(i)
     free_enable = (i==2)
-    if not free_enable then
-      all_free_notes_off()
-    end
+    if not free_enable then all_free_notes_off() end
     redraw()
   end)
-
-  params:add_option("free_mx_voice", "free play mx.samples", (#display_names>0 and display_names or {"(no packs)"}), 1)
+  params:add_option("free_mx_voice", "mx.samples", (#display_names>0 and display_names or {"(no packs)"}), 1)
   params:set_action("free_mx_voice", function(i) free_voice_index = i; free_load_selected(); redraw() end)
-
-  params:add_option(FREE_OUT_MODE_PARAM, "free play output", FREE_OUT_OPTS, 1)
+  params:add_option(FREE_OUT_MODE_PARAM, "output", FREE_OUT_OPTS, 1)
   params:set_action(FREE_OUT_MODE_PARAM, function(_)
     panic_all_outputs()
     rebind_midi_in_if_needed()
     redraw()
   end)
-
-  params:add_option(FREE_MIDI_OUT_DEV_PARAM, "free play MIDI out", midi_devices, 1)
+  params:add_option(FREE_MIDI_OUT_DEV_PARAM, "MIDI out", midi_devices, 1)
   params:set_action(FREE_MIDI_OUT_DEV_PARAM, function(i)
     setup_free_midi_out_awake(i)
     panic_all_outputs()
     rebind_midi_in_if_needed()
     redraw()
   end)
-
-  params:add_option(FREE_MIDI_OUT_CH_PARAM, "free play MIDI channel", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
+  params:add_option(FREE_MIDI_OUT_CH_PARAM, "MIDI out ch", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
   params:set_action(FREE_MIDI_OUT_CH_PARAM, function(idx)
     free_midi_channel = idx
     panic_all_outputs()
     rebind_midi_in_if_needed()
     redraw()
   end)
-
-  params:add_option(FREE_MIDI_IN_CH_PARAM, "free play MIDI input ch", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 2)
-
-  -- Free Play transpose (octaves)
+  params:add_option(FREE_MIDI_IN_CH_PARAM, "MIDI input ch", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 2)
   params:add_number("free_transpose_oct", "free play transpose (oct)", -4, 4, 0)
   params:set_action("free_transpose_oct", function(v)
     panic_all_outputs()
@@ -1315,6 +1330,13 @@ function init()
     setup_midi_out_awake(params:get(MIDI_OUT_DEV_PARAM) or 1)
     setup_free_midi_out_awake(params:get(FREE_MIDI_OUT_DEV_PARAM) or 1)
   end
+
+  -- Initial dynamic visibility states
+  show_param("chorder_quant_div", quantize)
+  show_param("chorder_swing_pct", swing_mode == 2)
+  show_param("chorder_vel_fixed", velocity_mode == 1)
+  show_param("chorder_inversion", voicing_mode ~= 11)
+  show_param(MIDI_GATE_PARAM, want_midi())
 
   -- clock
   recompute_root_midi()
@@ -1346,7 +1368,7 @@ function key(n, z)
         page = (page == PAGE_HUD) and PAGE_CHORD or PAGE_HUD
         redraw()
       else
-        panic_all_outputs()
+        panic_all_outputs() -- K3 short press: panic
       end
     end
   end
