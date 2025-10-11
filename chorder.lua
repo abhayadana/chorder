@@ -55,9 +55,14 @@ local strum_steps = 0
 
 -- Strum type
 local STRUM_OPTS = {
+  -- existing
   "up","down","up/down","down/up","random",
   "center-out","outside-in","bass-bounce","treble-bounce",
-  "random no-repeat first","random stable ends"
+  "random no-repeat first","random stable ends",
+  -- new (up)
+  "edge-kiss","ping-pair","arp chunk 2–3","guitar rake","harp gliss split",
+  -- new (down / interleaved)
+  "arp chunk 2–3 ↓","guitar rake ↓","harp gliss split (interleaved)"
 }
 local strum_type = 1
 
@@ -628,6 +633,111 @@ local function free_active_names()
   return table.concat(parts, " ")
 end
 
+-- Timing helpers
+-- easing
+local function ease_in_quad(t)  return t*t end
+local function ease_out_quad(t) return 1 - (1-t)*(1-t) end
+
+-- build per-note spacing (in "steps") according to timing shape
+local function compute_step_offsets(mn)
+  local base = math.max(0, strum_steps or 0)
+  if mn <= 1 or base == 0 then
+    local offs = {}
+    for k=1,mn do offs[k-1] = 0 end
+    return offs
+  end
+
+  local shape = params:get("chorder_timing_shape") or 1
+  local amt   = (params:get("chorder_timing_amt") or 50) / 100.0
+
+  -- start with uniform spacing per hop
+  local spacing = {}
+  for k=1,mn-1 do spacing[k] = base end
+
+  local function apply_serpentine()
+    local mid = (mn+1)/2
+    for k=1,mn-1 do
+      local d = math.abs((k - mid) / mid)      -- 0 center -> ~1 ends
+      spacing[k] = base * (1 + amt * d)
+    end
+  end
+
+  local function apply_accel()
+    for k=1,mn-1 do
+      local t = (k-1)/math.max(1,(mn-2))
+      spacing[k] = math.max(0.1, base * (1 - amt * t))
+    end
+  end
+
+  local function apply_rit()
+    for k=1,mn-1 do
+      local t = (k-1)/math.max(1,(mn-2))
+      spacing[k] = base * (1 + amt * t)
+    end
+  end
+
+  local function apply_rake(ease_fn)
+    for k=1,mn-1 do
+      local t = (k-1)/math.max(1,(mn-2))
+      local w = ease_fn(t)                      -- 0..1
+      spacing[k] = base * (1 - amt + amt * (1 + (w - 0.5)*2))
+      spacing[k] = math.max(0.1, spacing[k])
+    end
+  end
+
+  local function apply_skip_alt()
+    -- add extra whole steps every other gap
+    local add = params:get("chorder_timing_skip_steps") or 1
+    local add_eff = add * amt
+    for k=1,mn-1 do
+      if (k % 2) == 1 then
+        spacing[k] = spacing[k] + add_eff
+      end
+    end
+  end
+
+  if     shape == 2 then apply_serpentine()
+  elseif shape == 3 then apply_accel()
+  elseif shape == 4 then apply_rit()
+  elseif shape == 5 then apply_rake(ease_in_quad)
+  elseif shape == 6 then apply_rake(ease_out_quad)
+  elseif shape == 7 then apply_skip_alt()
+  end
+
+  -- convert spacing[] to cumulative integer offsets (in steps)
+  local offs = {}
+  local sum = 0
+  offs[0] = 0
+  for k=1,mn-1 do
+    sum = sum + spacing[k]
+    offs[k] = util.round(sum)
+  end
+  return offs
+end
+
+-- velocity post-shaping
+local function apply_velocity_profile(k, m, base_vel, note_idx_in_sorted, n_sorted)
+  local v = base_vel
+
+  -- ramp per step (k is position within play order)
+  local ramp = params:get("chorder_ramp_per_step") or 0
+  v = v + (k-1) * ramp
+
+  -- accent target
+  local acc_tgt = params:get("chorder_accent") or 1
+  local acc_amt = params:get("chorder_accent_amt") or 0
+  if acc_tgt == 2 then -- bass (lowest)
+    if note_idx_in_sorted == 1 then v = v + acc_amt end
+  elseif acc_tgt == 3 then -- top (highest)
+    if note_idx_in_sorted == n_sorted then v = v + acc_amt end
+  elseif acc_tgt == 4 then -- middle (nearest to center)
+    local mid = math.ceil(n_sorted/2)
+    if note_idx_in_sorted == mid then v = v + acc_amt end
+  end
+
+  return util.clamp(math.floor(v), 1, 127)
+end
+
 -- Quantize helper (kept in case we want nearest behavior elsewhere)
 local function quantize_nearest_to_scale(note)
   local sc = scale128()
@@ -903,32 +1013,117 @@ local function make_strum_order_pure(count, stype, state)
     return seq
   end
 
-  local n = #order
+  -- NEW helpers
+  local function edge_kiss(n)
+    -- low, high, low+1, high-1, … then resolve center (same as outside-in start)
+    local seq = {}
+    local i, j = 1, n
+    while i <= j do
+      table.insert(seq, i)
+      if i ~= j then table.insert(seq, j) end
+      i = i + 1; j = j - 1
+    end
+    return seq
+  end
 
-  if     stype == 1 then return order, state
-  elseif stype == 2 then reverse_inplace(order); return order, state
-  elseif stype == 3 then if state.alt_flip then reverse_inplace(order) end; state.alt_flip = not state.alt_flip; return order, state
-  elseif stype == 4 then if not state.alt_flip then reverse_inplace(order) end; state.alt_flip = not state.alt_flip; return order, state
-  elseif stype == 5 then shuffle_inplace(order); state.last_first=order[1]; state.last_last=order[#order]; return order, state
-  elseif stype == 6 then local seq=center_out(n); for k=1,n do order[k]=seq[k] end; state.last_first=order[1]; state.last_last=order[#order]; return order, state
-  elseif stype == 7 then local seq=outside_in(n); for k=1,n do order[k]=seq[k] end; state.last_first=order[1]; state.last_last=order[#order]; return order, state
-  elseif stype == 8 then local seq=outside_in(n); for k=1,n do order[k]=seq[k] end; state.last_first=order[1]; state.last_last=order[#order]; return order, state
-  elseif stype == 9 then local seq=outside_in(n); reverse_inplace(seq); for k=1,n do order[k]=seq[k] end; state.last_first=order[1]; state.last_last=order[#order]; return order, state
-  elseif stype == 10 then local tries=0; repeat shuffle_inplace(order); tries=tries+1 until (order[1]~=state.last_first) or tries>8; state.last_first=order[1]; state.last_last=order[#order]; return order, state
+  local function ping_pair(n)
+    -- low pair, high pair, inward
+    local seq = {}
+    local L, R = 1, n
+    while L < R do
+      table.insert(seq, L); if L+1 <= R then table.insert(seq, L+1) end
+      if R-1 >= L+2 then table.insert(seq, R-1) end
+      table.insert(seq, R)
+      L = L + 2; R = R - 2
+    end
+    if L == R then table.insert(seq, L) end
+    return seq
+  end
+
+  local function arp_chunk_2_3(n, direction_up)
+    -- chunks of 2 then 3, repeating
+    local base = {}
+    if direction_up then for i=1,n do base[#base+1] = i end
+    else for i=n,1,-1 do base[#base+1] = i end end
+    local seq, i, toggle = {}, 1, true
+    while i <= #base do
+      local size = toggle and 2 or 3
+      for k=i, math.min(i+size-1, #base) do seq[#seq+1] = base[k] end
+      i = i + size
+      toggle = not toggle
+    end
+    return seq
+  end
+
+  local function guitar_rake(n, up)
+    local seq = {}
+    if up then for i=1,n do seq[#seq+1]=i end else for i=n,1,-1 do seq[#seq+1]=i end end
+    return seq
+  end
+
+  local function harp_gliss_split(n)
+    -- lower half ascend, then upper half ascend
+    local mid = math.floor(n/2)
+    local lo = {}; for i=1,mid do lo[#lo+1] = i end
+    local hi = {}; for i=mid+1,n do hi[#hi+1] = i end
+    local seq = {}
+    for i=1,#lo do seq[#seq+1] = lo[i] end
+    for i=1,#hi do seq[#seq+1] = hi[i] end
+    return seq
+  end
+
+  local function harp_gliss_split_interleaved(n)
+    -- interleaved: L1,R1,L2,R2,…
+    local mid = math.floor(n/2)
+    local lo = {}; for i=1,mid do lo[#lo+1] = i end
+    local hi = {}; for i=mid+1,n do hi[#hi+1] = i end
+    local seq = {}
+    local i = 1
+    while i <= math.max(#lo, #hi) do
+      if i <= #lo then seq[#seq+1] = lo[i] end
+      if i <= #hi then seq[#seq+1] = hi[i] end
+      i = i + 1
+    end
+    return seq
+  end
+
+  local n = #order
+  if     stype == 1  then return order, state                               -- up
+  elseif stype == 2  then reverse_inplace(order); return order, state        -- down
+  elseif stype == 3  then if state.alt_flip then reverse_inplace(order) end; state.alt_flip = not state.alt_flip; return order, state
+  elseif stype == 4  then if not state.alt_flip then reverse_inplace(order) end; state.alt_flip = not state.alt_flip; return order, state
+  elseif stype == 5  then shuffle_inplace(order); state.last_first=order[1]; state.last_last=order[#order]; return order, state
+  elseif stype == 6  then local seq=center_out(n); for k=1,n do order[k]=seq[k] end; state.last_first=order[1]; state.last_last=order[#order]; return order, state
+  elseif stype == 7  then local seq=outside_in(n); for k=1,n do order[k]=seq[k] end; state.last_first=order[1]; state.last_last=order[#order]; return order, state
+  elseif stype == 8  then local seq=outside_in(n); for k=1,n do order[k]=seq[k] end; state.last_first=order[1]; state.last_last=order[#order]; return order, state
+  elseif stype == 9  then local seq=outside_in(n); reverse_inplace(seq); for k=1,n do order[k]=seq[k] end; state.last_first=order[1]; state.last_last=order[#order]; return order, state
+  elseif stype == 10 then
+    local tries=0; repeat shuffle_inplace(order); tries=tries+1 until (order[1]~=state.last_first) or tries>8
+    state.last_first=order[1]; state.last_last=order[#order]; return order, state
   elseif stype == 11 then
     if state.last_first and state.last_last and n >= 3 then
       local middle = {}
       for i=1,n do if i ~= state.last_first and i ~= state.last_last then middle[#middle+1] = i end end
-      if #middle >= (n-2) then
-        shuffle_inplace(middle)
-        local out = {}
-        out[1] = state.last_first
-        for i=1,#middle do out[#out+1] = middle[i] end
-        out[#out+1] = state.last_last
-        return out, state
-      end
+      shuffle_inplace(middle)
+      local out = { state.last_first }
+      for i=1,#middle do out[#out+1] = middle[i] end
+      out[#out+1] = state.last_last
+      return out, state
     end
     shuffle_inplace(order); state.last_first=order[1]; state.last_last=order[#order]; return order, state
+
+  -- NEW (up)
+  elseif stype == 12 then return edge_kiss(n), state                              -- edge-kiss
+  elseif stype == 13 then return ping_pair(n), state                               -- ping-pair
+  elseif stype == 14 then return arp_chunk_2_3(n, true), state                     -- arp chunk 2–3 (up)
+  elseif stype == 15 then return guitar_rake(n, true), state                       -- guitar rake (up)
+  elseif stype == 16 then return harp_gliss_split(n), state                        -- harp gliss split
+
+  -- NEW (down / interleaved)
+  elseif stype == 17 then return arp_chunk_2_3(n, false), state                    -- arp chunk 2–3 ↓
+  elseif stype == 18 then return guitar_rake(n, false), state                      -- guitar rake ↓
+  elseif stype == 19 then return harp_gliss_split_interleaved(n), state            -- harp gliss split (interleaved)
+
   end
 
   return order, state
@@ -977,13 +1172,47 @@ handle_note_on = function(canon, root_note, vel, deg)
 
   last_chord_name = build_chord_display_name(chord, qual, name_root_midi); last_name_time = now()
 
+  -- play order & offsets
   local order = make_strum_order(#chord)
+  local offs  = compute_step_offsets(#order)
+
+  -- precompute sorted index map for accent logic
+  local sorted = clone_sorted(chord)
+  local idx_in_sorted = {} -- midi -> first index in sorted
+  for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
+  local n_sorted = #sorted
+
+  -- flam settings
+  local flam_on    = (params:get("chorder_flam") or 1) == 2
+  local flam_cnt   = params:get("chorder_flam_count") or 0
+  local flam_space = params:get("chorder_flam_space") or 1
+  local flam_dvel  = params:get("chorder_flam_vel") or -8
+
   for k,idx in ipairs(order) do
     local n = chord[idx]
-    local s = (k-1) * (strum_steps or 0)
+
+    -- base time in steps for this note
+    local s = offs[k-1] or 0
+
+    -- humanize timing jitter in steps
     s = s + jitter_steps(humanize_steps_max)
-    local v = jitter_velocity(vel, humanize_vel_range)
+
+    -- velocity shaping (ramp + accent) + humanize vel
+    local v_base = jitter_velocity(vel, humanize_vel_range)
+    local pos_in_sorted = idx_in_sorted[n] or 1
+    local v = apply_velocity_profile(k, #order, v_base, pos_in_sorted, n_sorted)
+
+    -- schedule primary hit
     schedule(s, function() fanout_note_on(canon, n, v) end)
+
+    -- optional flams: quick extra taps around the same index
+    if flam_on and flam_cnt > 0 then
+      for j=1, flam_cnt do
+        local ds = j * flam_space
+        local vv = util.clamp(v + j * flam_dvel, 1, 127)
+        schedule(s + ds, function() fanout_note_on(canon, n, vv) end)
+      end
+    end
   end
 end
 
@@ -1120,53 +1349,24 @@ local function show_param(id, show)
   if show then params:show(id) else params:hide(id) end
 end
 
+-- -------- PARAM RE-ORG HELPERS --------
+local function add_section(title, builders)
+  params:add_group(title, #builders)
+  for _,fn in ipairs(builders) do fn() end
+end
+local function div(label)
+  return function() params:add_separator("— "..label.." —") end
+end
+-- --------------------------------------
+
 function init()
   mx = mxsamples:new()
   scan_instruments()
   build_midi_device_list_awake()
-
-  -------------------------------------------------------------------
-  -- Groups & Params (counts must match)
-  -------------------------------------------------------------------
-
-  -- 1) CHORDER · I/O & Devices (6)
-  params:add_group("CHORDER · I/O & Devices", 6)
-
-  -- output
-  params:add_option(OUT_MODE_PARAM, "output", OUT_OPTS, 1)
-  params:set_action(OUT_MODE_PARAM, function(_)
-    -- autohide MIDI gate unless output includes MIDI
-    local includes_midi = want_midi()
-    show_param(MIDI_GATE_PARAM, includes_midi)
-    panic_all_outputs()
-    rebind_midi_in_if_needed()
-    redraw()
-  end)
-
-  -- MIDI output device
-  params:add_option(MIDI_OUT_DEV_PARAM, "MIDI output", midi_devices, 1)
-  params:set_action(MIDI_OUT_DEV_PARAM, function(i)
-    panic_all_outputs()
-    setup_midi_out_awake(i)
-    rebind_midi_in_if_needed()
-    redraw()
-  end)
-
-  -- MIDI output channel
-  params:add_option(MIDI_OUT_CH_PARAM, "MIDI output channel", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
-  params:set_action(MIDI_OUT_CH_PARAM, function(idx)
-    midi_channel = idx
-    panic_all_outputs()
-    rebind_midi_in_if_needed()
-    redraw()
-  end)
-
-  -- MIDI gate (autohide if output excludes MIDI)
-  params:add_option(MIDI_GATE_PARAM, "MIDI gate", MIDI_GATE_OPTS, 1)
-
-  -- MIDI input (device)
   build_midi_in_device_list_awake()
-  local function default_midi_in_index_from_long(long_name)
+
+  -- ========= SECTION 1: CHORDER · I/O =========
+  local default_midi_in_index = (function(long_name)
     if not long_name or long_name == "" then return 1 end
     for i = 2, #midi_in_devices do
       local vp = midi_in_ports_map[i]
@@ -1174,148 +1374,284 @@ function init()
       if ln == long_name then return i end
     end
     return 1
-  end
-  local default_midi_in_index = default_midi_in_index_from_long(DEFAULT_MIDI_IN_NAME)
-  params:add_option(MIDI_IN_DEV_PARAM, "MIDI input", midi_in_devices, default_midi_in_index)
-  params:set_action(MIDI_IN_DEV_PARAM, function(i) setup_midi_in(i) end)
+  end)(DEFAULT_MIDI_IN_NAME)
 
-  -- chord MIDI input channel (1=omni, else ch+1)
-  local ch_opts_in = {"omni"}; for i=1,16 do ch_opts_in[#ch_opts_in+1]=tostring(i) end
-  params:add_option(MIDI_IN_CH_PARAM, "chord MIDI input ch", ch_opts_in, 1)
+  local g_io = {
+    div("Output"),
+    function()
+      params:add_option(OUT_MODE_PARAM, "output", OUT_OPTS, 1)
+      params:set_action(OUT_MODE_PARAM, function(_)
+        local includes_midi = want_midi()
+        show_param(MIDI_GATE_PARAM, includes_midi)
+        panic_all_outputs()
+        rebind_midi_in_if_needed()
+        redraw()
+      end)
+    end,
 
-  -- 2) CHORDER · Instrument (mx.samples) (2)
-  params:add_group("CHORDER · Instrument (mx.samples)", 2)
-  params:add_option("chorder_mx_voice", "mx.samples", (#display_names>0 and display_names or {"(no packs)"}), 1)
-  params:set_action("chorder_mx_voice", function(i) voice_index = i; ensure_selected_loaded(); redraw() end)
-  params:add_trigger("chorder_refresh_voices", "refresh instrument list")
-  params:set_action("chorder_refresh_voices", function()
-    scan_instruments()
-    local p = params:lookup_param("chorder_mx_voice")
-    if p then
-      p.options = (#display_names>0 and display_names or {"(no packs)"})
-      p.count   = (#display_names>0 and #display_names or 1)
-      voice_index = 1; params:set("chorder_mx_voice", voice_index)
-    end
-    -- also refresh free play instrument list
-    local pf = params:lookup_param("free_mx_voice")
-    if pf then
-      pf.options = (#display_names>0 and display_names or {"(no packs)"})
-      pf.count   = (#display_names>0 and #display_names or 1)
-      free_voice_index = 1; params:set("free_mx_voice", free_voice_index)
-    end
-    redraw()
-  end)
+    div("MIDI Out"),
+    function()
+      params:add_option(MIDI_OUT_DEV_PARAM, "MIDI output", midi_devices, 1)
+      params:set_action(MIDI_OUT_DEV_PARAM, function(i)
+        panic_all_outputs()
+        setup_midi_out_awake(i)
+        rebind_midi_in_if_needed()
+        redraw()
+      end)
+    end,
+    function()
+      params:add_option(MIDI_OUT_CH_PARAM, "MIDI output channel", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
+      params:set_action(MIDI_OUT_CH_PARAM, function(idx)
+        midi_channel = idx
+        panic_all_outputs()
+        rebind_midi_in_if_needed()
+        redraw()
+      end)
+    end,
+    function()
+      params:add_option(MIDI_GATE_PARAM, "MIDI gate", MIDI_GATE_OPTS, 1)
+    end,
 
-  -- 3) CHORDER · Key & Scale (3)
-  params:add_group("CHORDER · Key & Scale", 3)
-  params:add_option("chorder_root_pc", "root pitch", NOTE_NAMES_SHARP, root_pc+1)
-  params:set_action("chorder_root_pc", function(i) root_pc = i-1; recompute_root_midi(); redraw() end)
-  params:add_number("chorder_root_oct", "root octave", -1, 8, root_oct)
-  params:set_action("chorder_root_oct", function(v) root_oct = util.clamp(v,-1,8); recompute_root_midi(); redraw() end)
-  params:add_option("chorder_scale", "scale/mode", SCALE_NAMES, 1)
-  params:set_action("chorder_scale", function(i) scale_name = SCALE_NAMES[i] or "Major"; redraw() end)
+    div("MIDI In"),
+    function()
+      params:add_option(MIDI_IN_DEV_PARAM, "MIDI input", midi_in_devices, default_midi_in_index)
+      params:set_action(MIDI_IN_DEV_PARAM, function(i) setup_midi_in(i) end)
+    end,
+    function()
+      local ch_opts_in = {"omni"}; for i=1,16 do ch_opts_in[#ch_opts_in+1]=tostring(i) end
+      params:add_option(MIDI_IN_CH_PARAM, "chord MIDI input ch", ch_opts_in, 1)
+    end,
 
-  -- 4) CHORDER · Chord Build (5)
-  params:add_group("CHORDER · Chord Build", 5)
-  params:add_option("chorder_seventh", "chord type", {"triad", "7th"}, 1)
-  params:set_action("chorder_seventh", function(i) seventh_mode = (i==2); redraw() end)
-  params:add_number("chorder_inversion", "inversion (0-3)", 0, 3, inversion)
-  params:set_action("chorder_inversion", function(v) inversion = util.clamp(v,0,3); redraw() end)
-  params:add_number("chorder_spread", "spread (semitones)", -24, 24, spread_semitones)
-  params:set_action("chorder_spread", function(v) spread_semitones = util.round(v); redraw() end)
+    div("Instruments (Chord)"),
+    function()
+      params:add_option("chorder_mx_voice", "mx.samples", (#display_names>0 and display_names or {"(no packs)"}), 1)
+      params:set_action("chorder_mx_voice", function(i) voice_index = i; ensure_selected_loaded(); redraw() end)
+    end,
+    function()
+      params:add_trigger("chorder_refresh_voices", "refresh instrument list")
+      params:set_action("chorder_refresh_voices", function()
+        scan_instruments()
+        local p = params:lookup_param("chorder_mx_voice")
+        if p then
+          p.options = (#display_names>0 and display_names or {"(no packs)"})
+          p.count   = (#display_names>0 and #display_names or 1)
+          voice_index = 1; params:set("chorder_mx_voice", voice_index)
+        end
+        -- also refresh free play instrument list
+        local pf = params:lookup_param("free_mx_voice")
+        if pf then
+          pf.options = (#display_names>0 and display_names or {"(no packs)"})
+          pf.count   = (#display_names>0 and #display_names or 1)
+          free_voice_index = 1; params:set("free_mx_voice", free_voice_index)
+        end
+        redraw()
+      end)
+    end,
+  }
+  add_section("CHORDER · I/O", g_io)
+
+  -- ========= SECTION 2: CHORDER · Musical Setup =========
   local VOICE_OPTS = {
     "none","drop-2","drop-3","drop-2&4","drop-1",
     "open","wide","quartal","quintal","nearest","smooth"
   }
-  params:add_option("chorder_voicing", "voicing", VOICE_OPTS, voicing_mode)
-  params:set_action("chorder_voicing", function(i)
-    voicing_mode = i
-    -- inversion hidden when voicing=smooth
-    show_param("chorder_inversion", voicing_mode ~= 11)
-    redraw()
-  end)
-  params:add_option("chorder_bass_note", "add bass (root -12)", {"off","on"}, (add_bass and 2 or 1))
-  params:set_action("chorder_bass_note", function(i) add_bass = (i==2); redraw() end)
 
-  -- 5) CHORDER · Timing & Feel (8)
-  params:add_group("CHORDER · Timing & Feel", 8)
-  params:add_option("chorder_quantize", "quantize chords", {"off","on"}, (quantize and 2 or 1))
-  params:set_action("chorder_quantize", function(i)
-    quantize = (i==2)
-    show_param("chorder_quant_div", quantize)
-    redraw()
-  end)
-  params:add_option("chorder_quant_div", "quantize division", QUANT_DIV_OPTS, 3)
-  params:set_action("chorder_quant_div", function(i)
-    tick_div_str = QUANT_DIV_OPTS[i]; tick_div = QUANT_DIV_MAP[tick_div_str] or 1/4; redraw()
-  end)
-  params:add_number("chorder_strum", "strum (steps of division)", 0, 8, strum_steps)
-  params:set_action("chorder_strum", function(v) strum_steps = util.clamp(v,0,8); redraw() end)
-  params:add_option("chorder_strum_type", "strum type", STRUM_OPTS, strum_type)
-  params:set_action("chorder_strum_type", function(i)
-    strum_type = i
-    strum_state = { alt_flip=false, last_first=nil, last_last=nil }
-    redraw()
-  end)
-  params:add_option("chorder_swing_mode", "swing mode", {"grid","swing %"}, swing_mode)
-  params:set_action("chorder_swing_mode", function(i)
-    swing_mode = i
-    show_param("chorder_swing_pct", swing_mode == 2)
-    redraw()
-  end)
-  params:add_number("chorder_swing_pct", "swing %", 0, 75, swing_percent)
-  params:set_action("chorder_swing_pct", function(v) swing_percent = util.clamp(v, 0, 75); redraw() end)
-  params:add_number("chorder_hum_steps", "humanize timing (max steps)", 0, 4, humanize_steps_max)
-  params:set_action("chorder_hum_steps", function(v) humanize_steps_max = util.clamp(v,0,4); redraw() end)
-  params:add_number("chorder_hum_vel", "humanize velocity (+/-)", 0, 30, humanize_vel_range)
-  params:set_action("chorder_hum_vel", function(v) humanize_vel_range = util.clamp(v,0,30); redraw() end)
+  local g_setup = {
+    div("Key & Scale"),
+    function()
+      params:add_option("chorder_root_pc", "root pitch", NOTE_NAMES_SHARP, root_pc+1)
+      params:set_action("chorder_root_pc", function(i) root_pc = i-1; recompute_root_midi(); redraw() end)
+    end,
+    function()
+      params:add_number("chorder_root_oct", "root octave", -1, 8, root_oct)
+      params:set_action("chorder_root_oct", function(v) root_oct = util.clamp(v,-1,8); recompute_root_midi(); redraw() end)
+    end,
+    function()
+      params:add_option("chorder_scale", "scale/mode", SCALE_NAMES, 1)
+      params:set_action("chorder_scale", function(i) scale_name = SCALE_NAMES[i] or "Major"; redraw() end)
+    end,
 
-  -- 6) CHORDER · Velocity (Chord) (2)
-  params:add_group("CHORDER · Velocity (Chord)", 2)
-  params:add_option("chorder_vel_mode", "velocity src (chord)", {"fixed","incoming"}, velocity_mode)
-  params:set_action("chorder_vel_mode", function(i)
-    velocity_mode = i
-    show_param("chorder_vel_fixed", i==1)
-  end)
-  params:add_number("chorder_vel_fixed", "fixed velocity (chord)", 1, 127, fixed_velocity)
-  params:set_action("chorder_vel_fixed", function(v) fixed_velocity = util.clamp(v,1,127) end)
+    div("Chord Build"),
+    function()
+      params:add_option("chorder_seventh", "chord type", {"triad", "7th"}, 1)
+      params:set_action("chorder_seventh", function(i) seventh_mode = (i==2); redraw() end)
+    end,
+    function()
+      params:add_number("chorder_inversion", "inversion (0-3)", 0, 3, inversion)
+      params:set_action("chorder_inversion", function(v) inversion = util.clamp(v,0,3); redraw() end)
+    end,
+    function()
+      params:add_number("chorder_spread", "spread (semitones)", -24, 24, spread_semitones)
+      params:set_action("chorder_spread", function(v) spread_semitones = util.round(v); redraw() end)
+    end,
 
-  -- 7) CHORDER · Free Play (7)  -- unswung / unhumanized by request
-  params:add_group("CHORDER · Free Play", 7)
-  params:add_option("free_enable", "free play", {"off","on"}, 1)
-  params:set_action("free_enable", function(i)
-    free_enable = (i==2)
-    if not free_enable then all_free_notes_off() end
-    redraw()
-  end)
-  params:add_option("free_mx_voice", "mx.samples", (#display_names>0 and display_names or {"(no packs)"}), 1)
-  params:set_action("free_mx_voice", function(i) free_voice_index = i; free_load_selected(); redraw() end)
-  params:add_option(FREE_OUT_MODE_PARAM, "output", FREE_OUT_OPTS, 1)
-  params:set_action(FREE_OUT_MODE_PARAM, function(_)
-    panic_all_outputs()
-    rebind_midi_in_if_needed()
-    redraw()
-  end)
-  params:add_option(FREE_MIDI_OUT_DEV_PARAM, "MIDI out", midi_devices, 1)
-  params:set_action(FREE_MIDI_OUT_DEV_PARAM, function(i)
-    setup_free_midi_out_awake(i)
-    panic_all_outputs()
-    rebind_midi_in_if_needed()
-    redraw()
-  end)
-  params:add_option(FREE_MIDI_OUT_CH_PARAM, "MIDI out ch", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
-  params:set_action(FREE_MIDI_OUT_CH_PARAM, function(idx)
-    free_midi_channel = idx
-    panic_all_outputs()
-    rebind_midi_in_if_needed()
-    redraw()
-  end)
-  params:add_option(FREE_MIDI_IN_CH_PARAM, "MIDI input ch", (function() local t={}; for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 2)
-  params:add_number("free_transpose_oct", "free play transpose (oct)", -4, 4, 0)
-  params:set_action("free_transpose_oct", function(v)
-    panic_all_outputs()
-    free_transpose_oct = util.clamp(v, -4, 4)
-  end)
+    div("Voicing & Bass"),
+    function()
+      params:add_option("chorder_voicing", "voicing", VOICE_OPTS, voicing_mode)
+      params:set_action("chorder_voicing", function(i)
+        voicing_mode = i
+        -- inversion hidden when voicing=smooth
+        show_param("chorder_inversion", voicing_mode ~= 11)
+        redraw()
+      end)
+    end,
+    function()
+      params:add_option("chorder_bass_note", "add bass (root -12)", {"off","on"}, (add_bass and 2 or 1))
+      params:set_action("chorder_bass_note", function(i) add_bass = (i==2); redraw() end)
+    end,
+
+    div("Velocity (Chord)"),
+    function()
+      params:add_option("chorder_vel_mode", "velocity src (chord)", {"fixed","incoming"}, velocity_mode)
+      params:set_action("chorder_vel_mode", function(i)
+        velocity_mode = i
+        show_param("chorder_vel_fixed", i==1)
+      end)
+    end,
+    function()
+      params:add_number("chorder_vel_fixed", "fixed velocity (chord)", 1, 127, fixed_velocity)
+      params:set_action("chorder_vel_fixed", function(v) fixed_velocity = util.clamp(v,1,127) end)
+    end,
+  }
+  add_section("CHORDER · Musical Setup", g_setup)
+
+  -- ========= SECTION 3: CHORDER · Timing & Feel =========
+  local g_timing = {
+    div("Clock & Grid"),
+    function()
+      params:add_option("chorder_quantize", "quantize chords", {"off","on"}, (quantize and 2 or 1))
+      params:set_action("chorder_quantize", function(i)
+        quantize = (i==2)
+        redraw()
+      end)
+    end,
+    function()
+      params:add_option("chorder_quant_div", "quantize division", QUANT_DIV_OPTS, 4)
+      params:set_action("chorder_quant_div", function(i)
+        tick_div_str = QUANT_DIV_OPTS[i]
+        tick_div = QUANT_DIV_MAP[tick_div_str] or 1/4
+        redraw()
+      end)
+    end,
+    function()
+      params:add_option("chorder_swing_mode", "swing mode", {"grid","swing %"}, swing_mode)
+      params:set_action("chorder_swing_mode", function(i)
+        swing_mode = i
+        show_param("chorder_swing_pct", swing_mode == 2)
+        redraw()
+      end)
+    end,
+    function()
+      params:add_number("chorder_swing_pct", "swing %", 0, 75, swing_percent)
+      params:set_action("chorder_swing_pct", function(v) swing_percent = util.clamp(v, 0, 75); redraw() end)
+    end,
+
+    div("Strum"),
+    function()
+      params:add_number("chorder_strum", "strum (steps of division)", 0, 8, strum_steps)
+      params:set_action("chorder_strum", function(v) strum_steps = util.clamp(v,0,8); redraw() end)
+    end,
+    function()
+      params:add_option("chorder_strum_type", "strum type", STRUM_OPTS, strum_type)
+      params:set_action("chorder_strum_type", function(i)
+        strum_type = i
+        strum_state = { alt_flip=false, last_first=nil, last_last=nil }
+        redraw()
+      end)
+    end,
+
+    div("Timing Shapes"),
+    function()
+      params:add_option("chorder_timing_shape", "timing shape",
+        {"straight","serpentine","accelerando","ritardando","rake ease-in","rake ease-out","skip alt gaps"}, 1)
+    end,
+    function() params:add_number("chorder_timing_amt", "timing amount", 0, 100, 50) end,
+    function() params:add_number("chorder_timing_skip_steps", "skip size (steps)", 0, 8, 1) end,
+
+    div("Humanize"),
+    function()
+      params:add_number("chorder_hum_steps", "humanize timing (max steps)", 0, 4, humanize_steps_max)
+      params:set_action("chorder_hum_steps", function(v) humanize_steps_max = util.clamp(v,0,4); redraw() end)
+    end,
+    function()
+      params:add_number("chorder_hum_vel", "humanize velocity (+/-)", 0, 30, humanize_vel_range)
+      params:set_action("chorder_hum_vel", function(v) humanize_vel_range = util.clamp(v,0,30); redraw() end)
+    end,
+
+    div("Dynamics"),
+    function() params:add_number("chorder_ramp_per_step", "velocity ramp / step", -24, 24, -6) end,
+    function() params:add_option("chorder_accent", "accent target", {"none","bass","top","middle"}, 2) end,
+    function() params:add_number("chorder_accent_amt", "accent amount", -30, 30, 12) end,
+
+    div("Flam"),
+    function() params:add_option("chorder_flam", "flam", {"off","on"}, 1) end,
+    function() params:add_number("chorder_flam_count", "flam hits (extra)", 0, 3, 1) end,
+    function() params:add_number("chorder_flam_space", "flam spacing (steps)", 1, 4, 1) end,
+    function() params:add_number("chorder_flam_vel", "flam vel delta", -30, 0, -8) end,
+  }
+  add_section("CHORDER · Timing & Feel", g_timing)
+
+  -- ========= SECTION 4: CHORDER · Free Play =========
+  local g_free = {
+    div("Toggle"),
+    function()
+      params:add_option("free_enable", "free play", {"off","on"}, 1)
+      params:set_action("free_enable", function(i)
+        free_enable = (i==2)
+        if not free_enable then all_free_notes_off() end
+        redraw()
+      end)
+    end,
+
+    div("Instrument & Output"),
+    function()
+      params:add_option("free_mx_voice", "mx.samples", (#display_names>0 and display_names or {"(no packs)"}), 1)
+      params:set_action("free_mx_voice", function(i) free_voice_index = i; free_load_selected(); redraw() end)
+    end,
+    function()
+      params:add_option(FREE_OUT_MODE_PARAM, "output", FREE_OUT_OPTS, 1)
+      params:set_action(FREE_OUT_MODE_PARAM, function(_)
+        panic_all_outputs()
+        rebind_midi_in_if_needed()
+        redraw()
+      end)
+    end,
+
+    div("MIDI Out"),
+    function()
+      params:add_option(FREE_MIDI_OUT_DEV_PARAM, "MIDI out", midi_devices, 1)
+      params:set_action(FREE_MIDI_OUT_DEV_PARAM, function(i)
+        setup_free_midi_out_awake(i)
+        panic_all_outputs()
+        rebind_midi_in_if_needed()
+        redraw()
+      end)
+    end,
+    function()
+      params:add_option(FREE_MIDI_OUT_CH_PARAM, "MIDI out ch", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
+      params:set_action(FREE_MIDI_OUT_CH_PARAM, function(idx)
+        free_midi_channel = idx
+        panic_all_outputs()
+        rebind_midi_in_if_needed()
+        redraw()
+      end)
+    end,
+
+    div("MIDI In"),
+    function()
+      params:add_option(FREE_MIDI_IN_CH_PARAM, "MIDI input ch", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 2)
+    end,
+
+    div("Transpose"),
+    function()
+      params:add_number("free_transpose_oct", "free play transpose (oct)", -4, 4, 0)
+      params:set_action("free_transpose_oct", function(v)
+        panic_all_outputs()
+        free_transpose_oct = util.clamp(v, -4, 4)
+      end)
+    end,
+  }
+  add_section("CHORDER · Free Play", g_free)
 
   -- MIDI hotplug
   midi.add = function(dev)
@@ -1332,7 +1668,6 @@ function init()
   end
 
   -- Initial dynamic visibility states
-  show_param("chorder_quant_div", quantize)
   show_param("chorder_swing_pct", swing_mode == 2)
   show_param("chorder_vel_fixed", velocity_mode == 1)
   show_param("chorder_inversion", voicing_mode ~= 11)
