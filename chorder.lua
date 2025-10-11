@@ -107,9 +107,6 @@ local last_name_time = 0
 local last_name_timeout = 2.0 -- kept hardcoded by request
 
 -- ===== Free Play additions (Chord-enabled, independent) =====
--- Global policy decisions per user:
--- (1) Independent from chord voice; (2) Stay immediate; (3) Keep simpler;
--- (4) CC64 later; (5) Show in HUD; (6) No poly cap; (8) Hide gate unless MIDI out.
 local free_enable = false
 local free_voice_index = 1
 local FREE_OUT_MODE_PARAM = "free_out_mode"
@@ -146,6 +143,13 @@ local free_chord_active = {}  -- chord path: [incoming_note] = {out_notes...}
 -- HUD for Free Play chord symbol
 local last_free_chord_name = nil
 local last_free_name_time = 0
+
+-- ===== mx volume (global; affects only mx.samples) =====
+local mx_vol_pct = 100
+local function mx_scaled_vel(v)
+  local scaled = math.floor((v or 100) * (mx_vol_pct / 100))
+  return util.clamp(scaled, 1, 127)
+end
 
 -- ===== utils =====
 local function trim(s) return (s and s:gsub("^%s*(.-)%s*$", "%1")) or "" end
@@ -242,10 +246,17 @@ local function ensure_selected_loaded()
   if folder then load_folder_into_helper(folder) end
 end
 
+-- central safe wrapper: includes per-hit amp/gain for audible mx volume
 local function mx_on_safe(canon_name, midi_note, vel127)
   canon_name = sanitize_name(canon_name); if canon_name == "" then return end
   local ok, err = pcall(function()
-    mx:on({ name = canon_name, midi = midi_note, velocity = util.clamp(vel127,1,127) })
+    mx:on({
+      name = canon_name,
+      midi = midi_note,
+      velocity = util.clamp(vel127,1,127),
+      amp = mx_vol_pct / 100,   -- per-note amplitude
+      gain = mx_vol_pct / 100,  -- alias if engine prefers 'gain'
+    })
   end)
   if not ok then print("mx:on error: "..tostring(err).." (name='"..canon_name.."')") end
 end
@@ -558,8 +569,7 @@ local function base_chord_symbol(root_pc_val, qual, want7th)
 end
 
 local function build_chord_display_name(notes, qual, name_root_midi)
-  if type(notes) ~= "table" or #notes == 0 then return ""
-  end
+  if type(notes) ~= "table" or #notes == 0 then return "" end
   local root_pc_val = name_root_midi % 12
   local symbol = base_chord_symbol(root_pc_val, qual, seventh_mode)
   local bass = notes[1]; for i=2,#notes do if notes[i] < bass then bass = notes[i] end end
@@ -744,7 +754,7 @@ local function setup_free_midi_out_awake(param_index)
   end
 end
 
-local function free_note_on_mx(canon, note, vel) mx_on_safe(canon, note, vel) end
+local function free_note_on_mx(canon, note, vel) mx_on_safe(canon, note, mx_scaled_vel(vel)) end
 local function free_note_off_mx(canon, note) mx_off_safe(canon, note) end
 local function free_note_on_midi(note, vel)
   if free_mout then pcall(function() free_mout:note_on(util.clamp(note,0,127), util.clamp(vel or 100,1,127), free_midi_channel) end) end
@@ -785,19 +795,16 @@ local function free_chord_note_on(in_note, in_vel)
   -- CHORD path (independent recipe; simpler timing)
   local want7 = (free_seventh == 2)
 
-  -- Temporarily override global voicing/add_bass for building, keep others via args
+  -- Temporarily override global voicing/add_bass for building
   local keep_voicing, keep_add = voicing_mode, add_bass
   voicing_mode, add_bass = free_voicing, (free_add_bass==2)
-
   local chord_notes, qual, name_root_midi = chord_for_degree(base, deg, want7, free_inversion, free_spread)
-
-  -- restore globals
   voicing_mode, add_bass = keep_voicing, keep_add
 
   table.sort(chord_notes)
   local ord = (#chord_notes>1 and free_strum_steps>0) and free_make_strum_order(#chord_notes) or (function(n) local t={} for i=1,n do t[i]=i end; return t end)(#chord_notes)
 
-  -- compute step offsets (simple, immediate)
+  -- compute step offsets (simple)
   local offs = {}
   offs[0] = 0
   for i=2,#ord do offs[i-1] = offs[i-2] + free_strum_steps end
@@ -863,7 +870,6 @@ end
 local handle_note_on, handle_note_off
 
 -- Unified setup for MIDI IN
-local m_event_free_ok_cache_ch = nil
 local function setup_midi_in(param_index)
   teardown_midi_in()
   local port = midi_in_ports_map[param_index] or 0
@@ -1169,9 +1175,7 @@ local function make_strum_order(count)
   return ord
 end
 
--- ===== Timing helpers (restored) =====
--- Build per-note spacing (in "steps") according to timing shape.
--- Uses global: strum_steps and params: chorder_timing_shape, chorder_timing_amt, chorder_timing_skip_steps
+-- ===== Timing helpers (restored for chord voice) =====
 local function compute_step_offsets(m)
   local base = math.max(0, strum_steps or 0)
   if m <= 1 or base == 0 then
@@ -1190,7 +1194,7 @@ local function compute_step_offsets(m)
   local function apply_serpentine()
     local mid = (m+1)/2
     for k=1,m-1 do
-      local d = math.abs((k - mid) / mid) -- 0 center -> ~1 ends
+      local d = math.abs((k - mid) / mid)
       spacing[k] = base * (1 + amt * d)
     end
   end
@@ -1215,7 +1219,7 @@ local function compute_step_offsets(m)
   local function apply_rake(ease_fn)
     for k=1,m-1 do
       local t = (k-1)/math.max(1,(m-2))
-      local w = ease_fn(t) -- 0..1
+      local w = ease_fn(t)
       spacing[k] = base * (1 - amt + amt * (1 + (w - 0.5)*2))
       spacing[k] = math.max(0.1, spacing[k])
     end
@@ -1239,7 +1243,6 @@ local function compute_step_offsets(m)
   elseif shape == 7 then apply_skip_alt()
   end
 
-  -- convert spacing[] to cumulative integer offsets (in steps)
   local offs = {}
   local sum = 0
   offs[0] = 0
@@ -1251,23 +1254,19 @@ local function compute_step_offsets(m)
 end
 
 -- ===== Velocity post-shaping (restored) =====
--- Applies ramp per step and optional accent (bass/top/middle) to a base velocity.
--- Uses params: chorder_ramp_per_step, chorder_accent, chorder_accent_amt
 local function apply_velocity_profile(k, m, base_vel, note_idx_in_sorted, n_sorted)
   local v = base_vel
 
-  -- ramp per step (k is position within play order)
   local ramp = params:get("chorder_ramp_per_step") or 0
   v = v + (k-1) * ramp
 
-  -- accent target
   local acc_tgt = params:get("chorder_accent") or 1
   local acc_amt = params:get("chorder_accent_amt") or 0
-  if acc_tgt == 2 then -- bass (lowest)
+  if acc_tgt == 2 then -- bass
     if note_idx_in_sorted == 1 then v = v + acc_amt end
-  elseif acc_tgt == 3 then -- top (highest)
+  elseif acc_tgt == 3 then -- top
     if note_idx_in_sorted == n_sorted then v = v + acc_amt end
-  elseif acc_tgt == 4 then -- middle (nearest to center)
+  elseif acc_tgt == 4 then -- middle
     local mid = math.ceil(n_sorted/2)
     if note_idx_in_sorted == mid then v = v + acc_amt end
   end
@@ -1282,7 +1281,7 @@ local function want_mx()   local mval = params:get(OUT_MODE_PARAM) or 1; return 
 local function want_midi() local mval = params:get(OUT_MODE_PARAM) or 1; return (mval==2) or (mval==3) end
 
 local function fanout_note_on(canon, note, vel)
-  if want_mx()   then mx_on_safe(canon, note, vel) end
+  if want_mx()   then mx_on_safe(canon, note, mx_scaled_vel(vel)) end
   if want_midi() then
     midi_out_on_awake(note, vel)
     schedule_gate_for_note(note) -- per-note gate
@@ -1331,20 +1330,15 @@ handle_note_on = function(canon, root_note, vel, deg)
   for k,idx in ipairs(order) do
     local n = chord[idx]
 
-    -- base time in steps for this note
     local s = offs[k-1] or 0
-
-    -- humanize timing jitter in steps
     s = s + jitter_steps(humanize_steps_max)
 
-    -- velocity shaping (ramp + accent) + humanize vel
     local v_base = jitter_velocity(vel, humanize_vel_range)
     local pos_in_sorted = idx_in_sorted[n] or 1
     local v = apply_velocity_profile(k, #order, v_base, pos_in_sorted, n_sorted)
 
     schedule(s, function() fanout_note_on(canon, n, v) end)
 
-    -- optional flams
     if flam_on and flam_cnt > 0 then
       for j=1, flam_cnt do
         local ds = j * flam_space
@@ -1371,31 +1365,32 @@ local function key_center_string()
   return string.format("%s (root %s%d)", name, rname, roct)
 end
 
--- Compact Output page
+-- Compact Output page (patched to show mx instrument and no Gate line)
 local function draw_output_page()
   draw_header("I/O")
 
   -- chord output summary
-  local out_mode_full = OUT_OPTS[params:get(OUT_MODE_PARAM) or 1] or "?"
+  local out_mode_full  = OUT_OPTS[params:get(OUT_MODE_PARAM) or 1] or "?"
   local out_mode_short = short_mode_name(out_mode_full)
+
   local out_idx  = params:get(MIDI_OUT_DEV_PARAM) or 1
   local out_lbl  = ellipsize(midi_devices[out_idx] or "—", 12)
   local mo_ch    = tostring(params:get(MIDI_OUT_CH_PARAM) or 1)
 
   -- chord input summary
-  local mi_i     = params:get(MIDI_IN_DEV_PARAM) or 1
-  local mi_lbl   = ellipsize(midi_in_devices[mi_i] or "none", 12)
+  local mi_i      = params:get(MIDI_IN_DEV_PARAM) or 1
+  local mi_lbl    = ellipsize(midi_in_devices[mi_i] or "none", 12)
   local ch_in_idx = params:get(MIDI_IN_CH_PARAM) or 1
   local ch_in_disp = (ch_in_idx==1) and "Omni" or ("Ch"..tostring(ch_in_idx-1))
 
   -- free play summary
-  local free_on     = (params:get("free_enable")==2)
+  local free_on        = (params:get("free_enable")==2)
   local free_mode_full = FREE_OUT_OPTS[params:get(FREE_OUT_MODE_PARAM) or 1] or "?"
   local free_mode_short = short_mode_name(free_mode_full)
-  local free_dev_i  = params:get(FREE_MIDI_OUT_DEV_PARAM) or 1
-  local free_dev    = ellipsize(midi_devices[free_dev_i] or "—", 12)
-  local free_ch     = tostring(params:get(FREE_MIDI_OUT_CH_PARAM) or 1)
-  local free_in_ch  = tostring(params:get(FREE_MIDI_IN_CH_PARAM) or 2)
+  local free_dev_i     = params:get(FREE_MIDI_OUT_DEV_PARAM) or 1
+  local free_dev       = ellipsize(midi_devices[free_dev_i] or "—", 12)
+  local free_ch        = tostring(params:get(FREE_MIDI_OUT_CH_PARAM) or 1)
+  local free_in_ch     = tostring(params:get(FREE_MIDI_IN_CH_PARAM) or 2)
 
   -- Row 1: Chord Out
   screen.level(12); screen.move(4, 22); screen.text("Out:")
@@ -1419,14 +1414,18 @@ local function draw_output_page()
     screen.text_right("off")
   end
 
-  -- Row 4: Free MIDI or Gate/BPM
-  if free_on and (free_mode_short == "MIDI" or free_mode_short == "mx+M") then
+  -- Row 4: mx.samples instrument (only if output includes mx.samples)
+  if want_mx() then
+    local cur_name = display_names[voice_index] or "(no packs)"
+    screen.level(12); screen.move(4, 58); screen.text("mx.samples:")
+    screen.level(15); screen.move(124,58); screen.text_right(ellipsize(cur_name, 18))
+  -- else if Free is on and includes MIDI, show its device; otherwise just BPM (no Gate)
+  elseif free_on and (free_mode_short == "MIDI" or free_mode_short == "mx+M") then
     screen.level(12); screen.move(4, 58); screen.text("Free MIDI:")
     screen.level(15); screen.move(124,58); screen.text_right(free_dev.." / Ch"..free_ch)
   else
-    local gate_txt = MIDI_GATE_OPTS[(params:get(MIDI_GATE_PARAM) or 1)] or "?"
     local bpm = string.format("%d BPM", math.floor(clock.get_tempo() or 120))
-    screen.level(10); screen.move(4, 58); screen.text("Gate: "..gate_txt.."   "..bpm)
+    screen.level(10); screen.move(4, 58); screen.text(bpm)
   end
 end
 
@@ -1500,15 +1499,19 @@ local function show_param(id, show)
   if show then params:show(id) else params:hide(id) end
 end
 
--- -------- PARAM RE-ORG HELPERS --------
+-- -------- PARAM RE-ORG HELPERS (unique separator IDs) --------
+local _sep_counter = 0
 local function add_section(title, builders)
   params:add_group(title, #builders)
   for _,fn in ipairs(builders) do fn() end
 end
 local function div(label)
-  return function() params:add_separator("— "..label.." —") end
+  return function()
+    _sep_counter = _sep_counter + 1
+    params:add_separator(("— %s — [%d]"):format(label or "", _sep_counter))
+  end
 end
--- --------------------------------------
+-- -------------------------------------------------------------
 
 function init()
   mx = mxsamples:new()
@@ -1533,7 +1536,7 @@ function init()
       params:add_option(OUT_MODE_PARAM, "output", OUT_OPTS, 1)
       params:set_action(OUT_MODE_PARAM, function(_)
         local includes_midi = want_midi()
-        show_param(MIDI_GATE_PARAM, includes_midi)
+        show_param(MIDI_GATE_PARAM, includes_midi) -- hide chord MIDI gate unless output includes MIDI
         panic_all_outputs()
         rebind_midi_in_if_needed()
         redraw()
@@ -1558,9 +1561,6 @@ function init()
         rebind_midi_in_if_needed()
         redraw()
       end)
-    end,
-    function()
-      params:add_option(MIDI_GATE_PARAM, "MIDI gate", MIDI_GATE_OPTS, 1)
     end,
 
     div("MIDI In"),
@@ -1596,6 +1596,14 @@ function init()
           free_voice_index = 1; params:set("free_mx_voice", free_voice_index)
         end
         redraw()
+      end)
+    end,
+
+    div("Levels"),
+    function()
+      params:add_number("chorder_mx_vol_pct", "mx volume (%)", 0, 200, 100)
+      params:set_action("chorder_mx_vol_pct", function(v)
+        mx_vol_pct = util.clamp(math.floor(v or 100), 0, 200)
       end)
     end,
   }
@@ -1694,6 +1702,12 @@ function init()
     function()
       params:add_number("chorder_swing_pct", "swing %", 0, 75, swing_percent)
       params:set_action("chorder_swing_pct", function(v) swing_percent = util.clamp(v, 0, 75); redraw() end)
+    end,
+
+    -- NEW: explicit Gate param (Chord MIDI) to satisfy show_param + gating
+    div("Gate (Chord MIDI)"),
+    function()
+      params:add_option(MIDI_GATE_PARAM, "MIDI gate", MIDI_GATE_OPTS, 1)
     end,
 
     div("Strum"),
@@ -1874,13 +1888,13 @@ function init()
     setup_free_midi_out_awake(params:get(FREE_MIDI_OUT_DEV_PARAM) or 1)
   end
 
-  -- Initial dynamic visibility states
+  -- Initial dynamic visibility states (after all params exist)
   show_param("chorder_swing_pct", swing_mode == 2)
   show_param("chorder_vel_fixed", velocity_mode == 1)
   show_param("chorder_inversion", voicing_mode ~= 11)
-  show_param(MIDI_GATE_PARAM, want_midi())
+  show_param(MIDI_GATE_PARAM, want_midi()) -- chord MIDI gate only visible if output includes MIDI
   show_param("free_vel_fixed", free_velocity_mode == 1)
-  show_param("free_gate_mode", free_want_midi()) -- hide unless Free includes MIDI
+  show_param("free_gate_mode", free_want_midi()) -- Free gate visible only if Free includes MIDI
 
   -- clock
   recompute_root_midi()
@@ -1919,17 +1933,40 @@ function key(n, z)
 end
 
 function enc(n, d)
+  -- E1: toggle between Output and Chord pages
   if n == 1 then
     page = (page == PAGE_OUTPUT) and PAGE_CHORD or PAGE_OUTPUT
-    redraw(); return
+    redraw()
+    return
   end
+
+  -- Output page encoders
   if page == PAGE_OUTPUT then
-    if n == 2 then params:delta(OUT_MODE_PARAM, d)
-    elseif n == 3 then params:delta(MIDI_GATE_PARAM, d) end
-  elseif page == PAGE_CHORD then
-    if n == 2 then params:delta("chorder_root_pc", d)
-    elseif n == 3 then params:delta("chorder_scale", d) end
+    if n == 2 then
+      -- change output mode
+      params:delta(OUT_MODE_PARAM, d)
+    elseif n == 3 then
+      -- if mx is in the output path, pick instrument; otherwise pick MIDI out device
+      if want_mx() then
+        params:delta("chorder_mx_voice", d)
+      else
+        params:delta(MIDI_OUT_DEV_PARAM, d)
+      end
+    end
+    return
   end
+
+  -- Chord page encoders
+  if page == PAGE_CHORD then
+    if n == 2 then
+      params:delta("chorder_root_pc", d)
+    elseif n == 3 then
+      params:delta("chorder_scale", d)
+    end
+    return
+  end
+
+  -- HUD page: no encoder actions
 end
 
 function cleanup()
