@@ -27,7 +27,9 @@ local root_pc, root_oct, root_midi = 0, 1, 24
 local scale_name = "Major"
 
 -- Chord build
-local seventh_mode = false
+-- Chord build
+local chord_type = 1         -- 1=triad, 2=7th, 3=9th
+local sus_mode   = 1         -- 1=normal, 2=sus2, 3=sus4
 local inversion = 0
 local spread_semitones = 0
 
@@ -511,13 +513,31 @@ local function apply_voicing(notes, base_idxs, sc, use7)
 end
 
 -- Build chord tones, return (notes ascending, quality, naming_root_midi)
-local function chord_for_degree(base_midi, deg, want7th, inv, spread)
+-- Build chord tones, return (notes ascending, quality, naming_root_midi)
+local function chord_for_degree(base_midi, deg, chord_type_sel, inv, spread, sus_sel)
   local sc = scale128()
   local i_root = nearest_index_with_degree(sc, base_midi, deg)
 
-  -- tertian stack by default (may be rebuilt by voicing)
+  -- tertian base stack: 1-3-5 (optionally 7 and 9)
   local idxs = { i_root, i_root+2, i_root+4 }
-  if want7th then idxs[#idxs+1] = i_root+6 end
+  local want7 = (chord_type_sel >= 2)
+  local want9 = (chord_type_sel >= 3)
+  if want7 then idxs[#idxs+1] = i_root+6 end
+  if want9 then idxs[#idxs+1] = i_root+8 end
+
+  -- third handling (sus): replace the third with 2 or 4
+  if sus_sel and sus_sel ~= 1 then
+    for k = 1, #idxs do
+      if idxs[k] == i_root+2 then -- the 3rd
+        if sus_sel == 2 then       -- sus2
+          idxs[k] = i_root+1
+        elseif sus_sel == 3 then   -- sus4
+          idxs[k] = i_root+3
+        end
+        break
+      end
+    end
+  end
 
   -- apply explicit inversion unless smooth-voiceleading mode picks it
   local inversion_is_forced = (voicing_mode ~= 11)
@@ -535,13 +555,13 @@ local function chord_for_degree(base_midi, deg, want7th, inv, spread)
     notes[#notes+1] = n + (spread or 0)
   end
 
-  -- quality + naming root
+  -- quality + naming root (quality still computed from 1-3-5 if present)
   local triad3 = {notes[1], notes[2], notes[3]}
   local quality = triad_quality(triad3)
   local name_root_midi = sc[i_root]
 
   -- apply selected voicing (may re-register / rebuild)
-  notes = apply_voicing(notes, idxs, sc, want7th)
+  notes = apply_voicing(notes, idxs, sc, want7)
 
   -- optional bass (root -12)
   if add_bass then notes[#notes+1] = (notes[1] - 12) end
@@ -551,27 +571,49 @@ local function chord_for_degree(base_midi, deg, want7th, inv, spread)
 end
 
 -- naming
-local function base_chord_symbol(root_pc_val, qual, want7th)
+local function base_chord_symbol(root_pc_val, qual, chord_type_sel, sus_sel)
   local root_txt = NOTE_NAMES_SHARP[(root_pc_val % 12) + 1]
-  if want7th then
-    if qual == "maj" then return root_txt .. "maj7" end
-    if qual == "min" then return root_txt .. "m7" end
-    if qual == "dim" then return root_txt .. "m7b5" end
-    if qual == "aug" then return root_txt .. "+7" end
-    return root_txt .. "7"
+
+  -- If suspended, we ignore major/minor triad quality in the symbol and use sus2/sus4.
+  local sus_suffix = (sus_sel == 2 and "sus2") or (sus_sel == 3 and "sus4") or nil
+
+  -- chord_type: 1=triad, 2=7th, 3=9th (9th implies 7th)
+  if sus_suffix then
+    if     chord_type_sel == 1 then return root_txt .. sus_suffix
+    elseif chord_type_sel == 2 then return root_txt .. "7"  .. sus_suffix
+    elseif chord_type_sel == 3 then return root_txt .. "9"  .. sus_suffix
+    end
+    return root_txt .. sus_suffix
   else
-    if qual == "maj" then return root_txt end
-    if qual == "min" then return root_txt .. "m" end
-    if qual == "dim" then return root_txt .. "dim" end
-    if qual == "aug" then return root_txt .. "+" end
-    return root_txt
+    if chord_type_sel == 3 then
+      -- 9th chord names
+      if qual == "maj" then return root_txt .. "maj9" end
+      if qual == "min" then return root_txt .. "m9" end
+      if qual == "dim" then return root_txt .. "m9b5" end -- simple convention
+      if qual == "aug" then return root_txt .. "+9" end
+      return root_txt .. "9"
+    elseif chord_type_sel == 2 then
+      -- 7th chord names
+      if qual == "maj" then return root_txt .. "maj7" end
+      if qual == "min" then return root_txt .. "m7" end
+      if qual == "dim" then return root_txt .. "m7b5" end
+      if qual == "aug" then return root_txt .. "+7" end
+      return root_txt .. "7"
+    else
+      -- triads
+      if qual == "maj" then return root_txt end
+      if qual == "min" then return root_txt .. "m" end
+      if qual == "dim" then return root_txt .. "dim" end
+      if qual == "aug" then return root_txt .. "+" end
+      return root_txt
+    end
   end
 end
 
 local function build_chord_display_name(notes, qual, name_root_midi)
   if type(notes) ~= "table" or #notes == 0 then return "" end
   local root_pc_val = name_root_midi % 12
-  local symbol = base_chord_symbol(root_pc_val, qual, seventh_mode)
+  local symbol = base_chord_symbol(root_pc_val, qual, chord_type, sus_mode)
   local bass = notes[1]; for i=2,#notes do if notes[i] < bass then bass = notes[i] end end
   local bass_pc = bass % 12
   if bass_pc ~= root_pc_val then symbol = symbol .. "/" .. NOTE_NAMES_SHARP[bass_pc + 1] end
@@ -600,8 +642,8 @@ end
 local function build_free_chord_display_name(notes, qual, name_root_midi)
   if type(notes) ~= "table" or #notes == 0 then return "" end
   local root_pc_val = name_root_midi % 12
-  local want7 = (free_seventh == 2)
-  local symbol = base_chord_symbol(root_pc_val, qual, want7)
+  local free_chord_type = (free_seventh == 2) and 2 or 1
+  local symbol = base_chord_symbol(root_pc_val, qual, free_chord_type, 1) -- sus normal
   local bass = notes[1]; for i=2,#notes do if notes[i] < bass then bass = notes[i] end end
   local bass_pc = bass % 12
   if bass_pc ~= root_pc_val then symbol = symbol .. "/" .. NOTE_NAMES_SHARP[bass_pc + 1] end
@@ -793,12 +835,12 @@ local function free_chord_note_on(in_note, in_vel)
   end
 
   -- CHORD path (independent recipe; simpler timing)
-  local want7 = (free_seventh == 2)
+  local free_chord_type = (free_seventh == 2) and 2 or 1  -- 1=triad, 2=7th
 
   -- Temporarily override global voicing/add_bass for building
   local keep_voicing, keep_add = voicing_mode, add_bass
   voicing_mode, add_bass = free_voicing, (free_add_bass==2)
-  local chord_notes, qual, name_root_midi = chord_for_degree(base, deg, want7, free_inversion, free_spread)
+  local chord_notes, qual, name_root_midi = chord_for_degree(base, deg, free_chord_type, free_inversion, free_spread, 1) -- sus normal
   voicing_mode, add_bass = keep_voicing, keep_add
 
   table.sort(chord_notes)
@@ -1303,8 +1345,7 @@ local function jitter_velocity(vel, range) if range <= 0 then return vel end; lo
 
 -- (forward-declared above)
 handle_note_on = function(canon, root_note, vel, deg)
-  local chord, qual, name_root_midi = chord_for_degree(root_note, deg, seventh_mode, inversion, spread_semitones)
-
+  local chord, qual, name_root_midi = chord_for_degree(root_note, deg, chord_type, inversion, spread_semitones, sus_mode)
   last_voiced_notes = {}
   for i,n in ipairs(chord) do last_voiced_notes[i] = n end
   last_bass_note = chord[1]
@@ -1353,7 +1394,7 @@ handle_note_off = function(canon, root_note)
   local pc = root_note % 12
   local deg = WHITE_TO_DEG[pc]
   if not deg then return end
-  local chord = chord_for_degree(root_note, deg, seventh_mode, inversion, spread_semitones)
+  local chord = chord_for_degree(root_note, deg, chord_type, inversion, spread_semitones, sus_mode)
   local notes = (type(chord)=="table" and chord[1] and type(chord[1])=="number") and chord or {}
   for _,n in ipairs(notes) do fanout_note_off(canon, n) end
 end
@@ -1632,8 +1673,18 @@ function init()
 
     div("Chord Build"),
     function()
-      params:add_option("chorder_seventh", "chord type", {"triad", "7th"}, 1)
-      params:set_action("chorder_seventh", function(i) seventh_mode = (i==2); redraw() end)
+      params:add_option("chorder_chord_type", "chord type", {"triad","7th","9th"}, chord_type)
+      params:set_action("chorder_chord_type", function(i)
+        chord_type = i
+        redraw()
+      end)
+    end,
+    function()
+      params:add_option("chorder_sus_mode", "third handling", {"normal","sus2","sus4"}, sus_mode)
+      params:set_action("chorder_sus_mode", function(i)
+        sus_mode = i
+        redraw()
+      end)
     end,
     function()
       params:add_number("chorder_inversion", "inversion (0-3)", 0, 3, inversion)
