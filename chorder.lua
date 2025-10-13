@@ -27,7 +27,6 @@ local root_pc, root_oct, root_midi = 0, 1, 24
 local scale_name = "Major"
 
 -- Chord build
--- Chord build
 local chord_type = 1         -- 1=triad, 2=7th, 3=9th
 local sus_mode   = 1         -- 1=normal, 2=sus2, 3=sus4
 local inversion = 0
@@ -122,9 +121,12 @@ local free_spread = 0
 local free_voicing = 1        -- same scale as VOICE_OPTS
 local free_add_bass = 1       -- 1=off, 2=on
 
--- Free Play: timing/feel (simple)
+-- Free Play: strum + timing shapes (simple & independent)
 local free_strum_steps = 0    -- in "steps" of tick_div; 0 = simultaneous
 local free_strum_type = 1     -- independent from chord voice
+local free_timing_shape = 1   -- 1=straight,2=serpentine,3=accel,4=rit,5=rake-in,6=rake-out,7=skip-alt
+local free_timing_amt = 50    -- 0..100 (percent)
+local free_timing_skip_steps = 1
 
 -- Free Play: velocity/gate
 local free_velocity_mode = 2  -- 1=fixed, 2=incoming
@@ -513,7 +515,6 @@ local function apply_voicing(notes, base_idxs, sc, use7)
 end
 
 -- Build chord tones, return (notes ascending, quality, naming_root_midi)
--- Build chord tones, return (notes ascending, quality, naming_root_midi)
 local function chord_for_degree(base_midi, deg, chord_type_sel, inv, spread, sus_sel)
   local sc = scale128()
   local i_root = nearest_index_with_degree(sc, base_midi, deg)
@@ -570,7 +571,7 @@ local function chord_for_degree(base_midi, deg, chord_type_sel, inv, spread, sus
   return notes, quality, name_root_midi
 end
 
--- naming
+-- naming helpers
 local function base_chord_symbol(root_pc_val, qual, chord_type_sel, sus_sel)
   local root_txt = NOTE_NAMES_SHARP[(root_pc_val % 12) + 1]
 
@@ -721,6 +722,10 @@ local function teardown_midi_in()
   if m then m.event = nil; m = nil end
 end
 
+-- ======= IMPORTANT: forward declaration for Option A =======
+local make_strum_order_pure
+-- ===========================================================
+
 -- ===== Free Play helpers =====
 local function free_load_selected()
   local folder = folder_names[free_voice_index]
@@ -745,11 +750,76 @@ local function free_active_names()
   return table.concat(parts, " ")
 end
 
--- Simple Free Play strum order (independent state; no alternation memory)
+-- Simple Free Play strum order (STATELESS per trigger)
 local function free_make_strum_order(count)
   local tmp_state = { alt_flip=false, last_first=nil, last_last=nil }
-  local ord = ({ (function() return make_strum_order_pure(count, free_strum_type, tmp_state) end)() })[1]
+  local ord = select(1, make_strum_order_pure(count, free_strum_type, tmp_state))
   return ord or {}
+end
+
+-- Free Play timing shapes (simple)
+local function free_compute_step_offsets(m)
+  local base = math.max(0, free_strum_steps or 0)
+  local offs = {}
+  if m <= 1 or base == 0 then
+    for k=1,m do offs[k] = 0 end
+    return offs
+  end
+
+  local amt = (free_timing_amt or 50) / 100.0
+  local spacing = {}
+  for k=1,m-1 do spacing[k] = base end
+
+  local function apply_serpentine()
+    local mid = (m+1)/2
+    for k=1,m-1 do
+      local d = math.abs((k - mid) / mid)
+      spacing[k] = base * (1 + amt * d)
+    end
+  end
+  local function apply_accel()
+    for k=1,m-1 do
+      local t = (k-1)/math.max(1,(m-2))
+      spacing[k] = math.max(0.1, base * (1 - amt * t))
+    end
+  end
+  local function apply_rit()
+    for k=1,m-1 do
+      local t = (k-1)/math.max(1,(m-2))
+      spacing[k] = base * (1 + amt * t)
+    end
+  end
+  local function ease_in_quad(t)  return t*t end
+  local function ease_out_quad(t) return 1 - (1-t)*(1-t) end
+  local function apply_rake(ease_fn)
+    for k=1,m-1 do
+      local t = (k-1)/math.max(1,(m-2))
+      local w = ease_fn(t)
+      spacing[k] = base * (1 - amt + amt * (1 + (w - 0.5)*2))
+      spacing[k] = math.max(0.1, spacing[k])
+    end
+  end
+  local function apply_skip_alt()
+    local add = (free_timing_skip_steps or 1) * amt
+    for k=1,m-1 do
+      if (k % 2) == 1 then spacing[k] = spacing[k] + add end
+    end
+  end
+
+  if     free_timing_shape == 2 then apply_serpentine()
+  elseif free_timing_shape == 3 then apply_accel()
+  elseif free_timing_shape == 4 then apply_rit()
+  elseif free_timing_shape == 5 then apply_rake(ease_in_quad)
+  elseif free_timing_shape == 6 then apply_rake(ease_out_quad)
+  elseif free_timing_shape == 7 then apply_skip_alt()
+  end
+
+  local sum = 0
+  for k=1,m do
+    if k == 1 then offs[k] = 0
+    else sum = sum + util.round(spacing[k-1]); offs[k] = sum end
+  end
+  return offs
 end
 
 -- Free Play MIDI gate computation
@@ -767,6 +837,7 @@ local function free_schedule_gate_for_note(note)
   local n = util.clamp(note, 0, 127)
   clock.run(function()
     clock.sleep(secs)
+    -- Gate affects BOTH MIDI and mx:
     if free_mout then pcall(function() free_mout:note_off(n, 0, free_midi_channel) end) end
     if mx then
       local fcanon = canonical_names[free_voice_index] or ""
@@ -828,13 +899,13 @@ local function free_chord_note_on(in_note, in_vel)
   local play_vel = (free_velocity_mode==1) and free_fixed_velocity or util.clamp(in_vel or 100,1,127)
 
   if free_mode == 1 then
-    -- MONO path (unchanged behavior)
+    -- MONO path
     free_active_map[in_note] = base
     free_fanout_on(fcanon, base, play_vel)
     return
   end
 
-  -- CHORD path (independent recipe; simpler timing)
+  -- CHORD path (independent recipe; stateless strum)
   local free_chord_type = (free_seventh == 2) and 2 or 1  -- 1=triad, 2=7th
 
   -- Temporarily override global voicing/add_bass for building
@@ -844,20 +915,18 @@ local function free_chord_note_on(in_note, in_vel)
   voicing_mode, add_bass = keep_voicing, keep_add
 
   table.sort(chord_notes)
-  local ord = (#chord_notes>1 and free_strum_steps>0) and free_make_strum_order(#chord_notes) or (function(n) local t={} for i=1,n do t[i]=i end; return t end)(#chord_notes)
 
-  -- compute step offsets (simple)
-  local offs = {}
-  offs[0] = 0
-  for i=2,#ord do offs[i-1] = offs[i-2] + free_strum_steps end
+  local ord = (#chord_notes>1 and free_strum_steps>0) and free_make_strum_order(#chord_notes) or (function(n) local t={} for i=1,n do t[i]=i end; return t end)(#chord_notes)
+  local offs = free_compute_step_offsets(#ord)
 
   local emitted = {}
   for k,idx in ipairs(ord) do
     local n = chord_notes[idx]
-    local s = offs[k-1] or 0
+    local s = offs[k] or 0
     free_schedule(s, function()
       free_fanout_on(fcanon, n, play_vel)
-      if free_want_midi() then free_schedule_gate_for_note(n) end
+      -- Gate affects BOTH MIDI and mx:
+      free_schedule_gate_for_note(n)
     end)
     emitted[#emitted+1] = n
   end
@@ -1056,7 +1125,8 @@ local function shuffle_inplace(t)
   end
 end
 
-local function make_strum_order_pure(count, stype, state)
+-- (Option A) assign to previously-declared local
+make_strum_order_pure = function(count, stype, state)
   state = state or { alt_flip=false, last_first=nil, last_last=nil }
   local order = {}
   for i = 1, math.max(count or 0, 0) do order[i] = i end
@@ -1205,7 +1275,6 @@ local function make_strum_order_pure(count, stype, state)
   elseif stype == 17 then return arp_chunk_2_3(n, false), state
   elseif stype == 18 then return guitar_rake(n, false), state
   elseif stype == 19 then return harp_gliss_split_interleaved(n), state
-
   end
 
   return order, state
@@ -1217,7 +1286,7 @@ local function make_strum_order(count)
   return ord
 end
 
--- ===== Timing helpers (restored for chord voice) =====
+-- ===== Timing helpers (Chord voice) =====
 local function compute_step_offsets(m)
   local base = math.max(0, strum_steps or 0)
   if m <= 1 or base == 0 then
@@ -1295,7 +1364,7 @@ local function compute_step_offsets(m)
   return offs
 end
 
--- ===== Velocity post-shaping (restored) =====
+-- ===== Velocity post-shaping (Chord voice) =====
 local function apply_velocity_profile(k, m, base_vel, note_idx_in_sorted, n_sorted)
   local v = base_vel
 
@@ -1895,6 +1964,22 @@ function init()
     function()
       params:add_option("free_strum_type", "strum type", STRUM_OPTS, free_strum_type)
       params:set_action("free_strum_type", function(i) free_strum_type = i end)
+    end,
+
+    -- NEW: Simple Timing Shapes for Free Play
+    div("Timing (Free)"),
+    function()
+      params:add_option("free_timing_shape", "timing shape",
+        {"straight","serpentine","accelerando","ritardando","rake ease-in","rake ease-out","skip alt gaps"}, free_timing_shape)
+      params:set_action("free_timing_shape", function(i) free_timing_shape = i end)
+    end,
+    function()
+      params:add_number("free_timing_amt", "timing amount", 0, 100, free_timing_amt)
+      params:set_action("free_timing_amt", function(v) free_timing_amt = util.clamp(v,0,100) end)
+    end,
+    function()
+      params:add_number("free_timing_skip_steps", "skip size (steps)", 0, 8, free_timing_skip_steps)
+      params:set_action("free_timing_skip_steps", function(v) free_timing_skip_steps = util.clamp(v,0,8) end)
     end,
 
     div("Velocity & Gate (Free)"),
