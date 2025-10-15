@@ -8,6 +8,7 @@ engine.name = "MxSamples"
 
 local musicutil = require "musicutil"
 local mxsamples = include "mx.samples/lib/mx.samples"
+local chordlib  = include "lib/chordlib"
 
 -- ===== config =====
 local BASE = _path.audio .. "mx.samples"
@@ -36,7 +37,7 @@ local S = {
 
   -- chord state
   last_voiced_notes = nil, last_bass_note = nil,
-  chord_active = {},  -- NEW: per-root record of emitted chord notes
+  chord_active = {},
 
   -- display / hud
   last_chord_name = nil, last_name_time = 0, last_name_timeout = 2.0,
@@ -71,7 +72,7 @@ local S = {
     out_opts = {"mx.samples","mx.samples + MIDI","MIDI"},
     strum_steps=0, strum_type=1, timing_shape=1, timing_amt=50, timing_skip_steps=1,
     velocity_mode=2, fixed_velocity=100, gate_mode=1, midi_channel=1,
-    key_mode_param = "free_key_mode", key_mode=1,  -- 1 white; 2 quantized; 3 chromatic mono
+    key_mode_param = "free_key_mode", key_mode=1,
     mode=1, seventh=1, inversion=0, spread=0, voicing=1, add_bass=1,
     transpose_oct=0,
     midi_out_dev_param = "free_midi_out_dev", midi_out_ch_param = "free_midi_out_ch",
@@ -288,203 +289,9 @@ local MIDI = (function()
   }
 end)()
 
--- ===== chord math & voicing =====
-local function scale128() return musicutil.generate_scale_of_length(S.root_midi, S.scale_name, 128) end
-
-local function nearest_index_with_degree(sc, midi, target_deg)
-  local best_i, best_d = 1, 999
-  for i=1,#sc do
-    if 1 + ((i-1) % 7) == target_deg then
-      local d = math.abs(sc[i] - midi)
-      if d < best_d then best_d, best_i = d, i end
-    end
-  end
-  return best_i
-end
-
-local function triad_quality(notes)
-  table.sort(notes)
-  local a = notes[2] - notes[1]
-  local b = notes[3] - notes[2]
-  if a == 4 and b == 3 then return "maj" end
-  if a == 3 and b == 4 then return "min" end
-  if a == 3 and b == 3 then return "dim" end
-  if a == 4 and b == 4 then return "aug" end
-  return "unk"
-end
-
-local function clone_sorted(t) local c = {}; for i,n in ipairs(t) do c[i]=n end; table.sort(c); return c end
-local function apply_drop(t, which_from_top) local v = clone_sorted(t); if #v < which_from_top then return v end; local idx = #v - which_from_top + 1; v[idx] = v[idx] - 12; table.sort(v); return v end
-local function apply_drop_multiple(t, list_from_top) local v = clone_sorted(t); table.sort(list_from_top); for i=#list_from_top,1,-1 do v = apply_drop(v, list_from_top[i]) end; return v end
-local function apply_open_position(t) local v = clone_sorted(t); if #v == 3 then v = { v[1], v[3], v[2] + 12 } elseif #v == 4 then v = { v[1], v[3], v[4], v[2] + 12 } end; table.sort(v); return v end
-local function apply_wide_spread(t) local v = clone_sorted(t); for i=2,#v,2 do v[i] = v[i] + 12 end; table.sort(v); return v end
-local function diatonic_stack(sc, i_root, steps, count) local idxs = {}; for k=0,(count-1) do idxs[#idxs+1] = i_root + k*steps end; return idxs end
-
-local function assign_register_nearest(target, prev)
-  local out = clone_sorted(target)
-  if not prev or #prev == 0 or #prev ~= #out then
-    local center = 60
-    local base = out[1]
-    local shift = math.floor((center - base) / 12)
-    for i=1,#out do out[i] = out[i] + shift*12 end
-    table.sort(out); return out
-  end
-  local v = {}; for i=1,#out do v[i] = out[i] end
-  local prev_low = prev[1]; local base = v[1]
-  local shift = math.floor(prev_low - base) // 12
-  for i=1,#v do v[i] = v[i] + shift*12 end
-  for i=1,#v do
-    local cur = v[i]; local want = prev[i]
-    local best = cur; local bestd = math.abs(cur - want)
-    local a = cur - 12; local ad = math.abs(a - want); if ad < bestd then best, bestd = a, ad end
-    local b = cur + 12; local bd = math.abs(b - want); if bd < bestd then best, bestd = b, bd end
-    v[i] = best
-  end
-  table.sort(v); return v
-end
-
-local function choose_smooth_inversion(base_idxs, sc, want7)
-  if not S.last_bass_note then return base_idxs end
-  local best_idxs, best = base_idxs, nil
-  local max_inv = math.max(0, (want7 and 3 or 2))
-  for inv=0,max_inv do
-    local idxs = {}
-    for _,ix in ipairs(base_idxs) do idxs[#idxs+1] = ix end
-    for _=1, math.min(inv, #idxs-1) do local n = table.remove(idxs, 1); table.insert(idxs, n + 7) end
-    local n0 = sc[util.clamp(idxs[1], 1, #sc)]
-    local d = math.abs(n0 - S.last_bass_note)
-    if not best or d < best then best = d; best_idxs = idxs end
-  end
-  return best_idxs
-end
-
-local function apply_voicing(notes, base_idxs, sc, use7)
-  local mode = S.voicing or 1
-  if     mode == 1 then return notes
-  elseif mode == 2 then return apply_drop(notes, 2)
-  elseif mode == 3 then return apply_drop(notes, 3)
-  elseif mode == 4 then return apply_drop_multiple(notes, {2,4})
-  elseif mode == 5 then return apply_drop(notes, 1)
-  elseif mode == 6 then return apply_open_position(notes)
-  elseif mode == 7 then return apply_wide_spread(notes)
-  elseif mode == 8 or mode == 9 then
-    local steps = (mode == 8) and 3 or 4
-    local count = use7 and 4 or 3
-    local i_root = base_idxs[1]
-    local idxs = diatonic_stack(sc, i_root, steps, count)
-    local out = {}; for _,ix in ipairs(idxs) do out[#out+1] = sc[util.clamp(ix,1,#sc)] end
-    table.sort(out); return out
-  elseif mode == 10 then return assign_register_nearest(notes, S.last_voiced_notes)
-  elseif mode == 11 then
-    local idxs = choose_smooth_inversion(base_idxs, sc, use7)
-    local out = {}; for _,ix in ipairs(idxs) do out[#out+1] = sc[util.clamp(ix,1,#sc)] end
-    table.sort(out); return out
-  end
-  return notes
-end
-
--- Build chord tones, return (notes ascending, quality, naming_root_midi)
-local function chord_for_degree(base_midi, deg, chord_type_sel, inv, spread, sus_sel)
-  local sc = scale128()
-  local i_root = nearest_index_with_degree(sc, base_midi, deg)
-
-  local idxs = { i_root, i_root+2, i_root+4 }
-  local want7 = (chord_type_sel >= 2)
-  local want9 = (chord_type_sel >= 3)
-  if want7 then idxs[#idxs+1] = i_root+6 end
-  if want9 then idxs[#idxs+1] = i_root+8 end
-
-  if sus_sel and sus_sel ~= 1 then
-    for k = 1, #idxs do
-      if idxs[k] == i_root+2 then
-        if     sus_sel == 2 then idxs[k] = i_root+1
-        elseif sus_sel == 3 then idxs[k] = i_root+3 end
-        break
-      end
-    end
-  end
-
-  local inversion_is_forced = (S.voicing ~= 11)
-  if inversion_is_forced then
-    for _ = 1, math.min(inv or 0, #idxs-1) do
-      local n = table.remove(idxs, 1)
-      table.insert(idxs, n + 7)
-    end
-  end
-
-  local notes = {}
-  for _,ix in ipairs(idxs) do
-    local n = sc[util.clamp(ix, 1, #sc)]
-    notes[#notes+1] = n + (spread or 0)
-  end
-
-  local triad3 = {notes[1], notes[2], notes[3]}
-  local quality = triad_quality(triad3)
-  local name_root_midi = sc[i_root]
-
-  notes = apply_voicing(notes, idxs, sc, want7)
-  if S.add_bass then notes[#notes+1] = (notes[1] - 12) end
-  table.sort(notes)
-  return notes, quality, name_root_midi
-end
-
-local function base_chord_symbol(root_pc_val, qual, chord_type_sel, sus_sel)
-  local root_txt = K.NOTE_NAMES_SHARP[(root_pc_val % 12) + 1]
-  local sus_suffix = (sus_sel == 2 and "sus2") or (sus_sel == 3 and "sus4") or nil
-  if sus_suffix then
-    if     chord_type_sel == 1 then return root_txt .. sus_suffix
-    elseif chord_type_sel == 2 then return root_txt .. "7"  .. sus_suffix
-    elseif chord_type_sel == 3 then return root_txt .. "9"  .. sus_suffix end
-    return root_txt .. sus_suffix
-  else
-    if     chord_type_sel == 3 then
-      if qual == "maj" then return root_txt .. "maj9"
-      elseif qual == "min" then return root_txt .. "m9"
-      elseif qual == "dim" then return root_txt .. "m9b5"
-      elseif qual == "aug" then return root_txt .. "+9" end
-      return root_txt .. "9"
-    elseif chord_type_sel == 2 then
-      if qual == "maj" then return root_txt .. "maj7"
-      elseif qual == "min" then return root_txt .. "m7"
-      elseif qual == "dim" then return root_txt .. "m7b5"
-      elseif qual == "aug" then return root_txt .. "+7" end
-      return root_txt .. "7"
-    else
-      if qual == "maj" then return root_txt
-      elseif qual == "min" then return root_txt .. "m"
-      elseif qual == "dim" then return root_txt .. "dim"
-      elseif qual == "aug" then return root_txt .. "+" end
-      return root_txt
-    end
-  end
-end
-
-local function build_chord_display_name(notes, qual, name_root_midi)
-  if type(notes) ~= "table" or #notes == 0 then return "" end
-  local root_pc_val = name_root_midi % 12
-  local symbol = base_chord_symbol(root_pc_val, qual, S.chord_type, S.sus_mode)
-  local bass = notes[1]; for i=2,#notes do if notes[i] < bass then bass = notes[i] end end
-  local bass_pc = bass % 12
-  if bass_pc ~= root_pc_val then symbol = symbol .. "/" .. K.NOTE_NAMES_SHARP[bass_pc + 1] end
-  local tags = {}
-  if S.inversion > 0 and (S.voicing ~= 11) then table.insert(tags, "inv"..S.inversion) end
-  if     S.voicing == 2 then table.insert(tags, "drop2")
-  elseif S.voicing == 3 then table.insert(tags, "drop3")
-  elseif S.voicing == 4 then table.insert(tags, "drop2&4")
-  elseif S.voicing == 5 then table.insert(tags, "drop1")
-  elseif S.voicing == 6 then table.insert(tags, "open")
-  elseif S.voicing == 7 then table.insert(tags, "wide")
-  elseif S.voicing == 8 then table.insert(tags, "quartal")
-  elseif S.voicing == 9 then table.insert(tags, "quintal")
-  elseif S.voicing == 10 then table.insert(tags, "nearest")
-  elseif S.voicing == 11 then table.insert(tags, "smooth") end
-  if S.add_bass and bass_pc == root_pc_val then table.insert(tags, "bass") end
-  if S.spread ~= 0 then
-    local s = (S.spread > 0) and ("+"..S.spread) or tostring(S.spread)
-    table.insert(tags, "spread"..s)
-  end
-  if #tags > 0 then symbol = symbol .. " (" .. table.concat(tags, ", ") .. ")" end
-  return symbol
+-- ===== chord/scale helpers (via chordlib) =====
+local function scale128()
+  return chordlib.build_scale(S.root_midi, S.scale_name)
 end
 
 -- ===== Strum module =====
@@ -977,14 +784,27 @@ local Free = (function()
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
     if S.free.mout then S.free.mout.event = nil; S.free.mout = nil end
     S.free.mout = midi.connect(real_port)
-    if S.free.mout then print("FREE MIDI OUT: connected to "..(midi.vports[real_port].name or ("port "..real_port)))
-    else print("FREE MIDI OUT: connect failed for port "..real_port) end
+    if S.free.mout then
+      print("FREE MIDI OUT: connected to "..(midi.vports[real_port].name or ("port "..real_port)))
+    else
+      print("FREE MIDI OUT: connect failed for port "..real_port)
+    end
   end
 
   local function free_note_on_mx(canon, note, vel) MX.on_free(canon, note, free_scaled_vel(vel)) end
-  local function free_note_off_mx(canon, note) MX.off(canon, note) end
-  local function free_note_on_midi(note, vel) if S.free.mout then pcall(function() S.free.mout:note_on(util.clamp(note,0,127), util.clamp(vel or 100,1,127), S.free.midi_channel) end) end end
-  local function free_note_off_midi(note) if S.free.mout then pcall(function() S.free.mout:note_off(util.clamp(note,0,127), 0, S.free.midi_channel) end) end end
+  private_free_off_mx = function(canon, note) MX.off(canon, note) end
+  local function free_note_off_mx(canon, note) private_free_off_mx(canon, note) end
+
+  local function free_note_on_midi(note, vel)
+    if S.free.mout then
+      pcall(function() S.free.mout:note_on(util.clamp(note,0,127), util.clamp(vel or 100,1,127), S.free.midi_channel) end)
+    end
+  end
+  local function free_note_off_midi(note)
+    if S.free.mout then
+      pcall(function() S.free.mout:note_off(util.clamp(note,0,127), 0, S.free.midi_channel) end)
+    end
+  end
 
   local function free_fanout_on(canon, note, vel)
     if free_want_mx()   then free_note_on_mx(canon, note, vel) end
@@ -995,18 +815,13 @@ local Free = (function()
     if free_want_midi() then free_note_off_midi(note) end
   end
 
-  -- quantize note to current scale
+  -- quantize note to current scale (uses chordlib)
   local function quantize_to_scale(note)
-    local sc = scale128()
-    local best_i, best_d, best_val = 1, 1e9, sc[1]
-    for i=1,#sc do
-      local v = sc[i]; local d = math.abs(v - note)
-      if d < best_d or (d == best_d and v > best_val) then best_d, best_i, best_val = d, i, v end
-    end
-    return best_val, best_i
+    local sc = chordlib.build_scale(S.root_midi, S.scale_name)
+    return chordlib.quantize_to_scale(sc, note)
   end
 
-  -- Free Play timing shape computation
+  -- ----- timing shapes for Free -----
   local function free_compute_step_offsets(m)
     local base = math.max(0, S.free.strum_steps or 0)
     local offs = {}
@@ -1057,6 +872,7 @@ local Free = (function()
     return ord or {}
   end
 
+  -- MIDI gate scheduling for Free
   local function free_compute_gate_seconds()
     local sel = S.free.gate_mode or 1
     if sel == 1 then return nil end
@@ -1076,6 +892,7 @@ local Free = (function()
     end)
   end
 
+  -- HUD helpers
   local function free_active_notes_ascending()
     local t = {}
     for _,q in pairs(S.free.active_map) do t[#t+1] = q end
@@ -1089,7 +906,6 @@ local Free = (function()
     return table.concat(parts, " ")
   end
 
-  -- public
   return {
     setup_midi_out = setup_free_midi_out_awake,
     fanout_on  = free_fanout_on,
@@ -1103,6 +919,7 @@ local Free = (function()
     quantize_to_scale = quantize_to_scale,
   }
 end)()
+
 
 -- ===== Event queue / clock =====
 local function queue_in_steps(steps, fn) table.insert(S.evq, {steps=math.max(0, steps), fn=fn}) end
@@ -1164,30 +981,53 @@ local function make_strum_order(count)
   return ord
 end
 
+local function build_chord_and_symbol(root_note, deg)
+  local sc = scale128()
+  local notes, qual, name_root_midi = chordlib.build_chord{
+    scale = sc,
+    base_midi = root_note,
+    degree = deg,
+    chord_type = S.chord_type,
+    inversion = S.inversion,
+    spread = S.spread,
+    sus_mode = S.sus_mode,
+    voicing_mode = S.voicing,
+    add_bass = S.add_bass,
+    last_voiced_notes = S.last_voiced_notes,
+    last_bass_note = S.last_bass_note
+  }
+  local symbol = chordlib.symbol_for(notes, qual, name_root_midi, {
+    chord_type = S.chord_type,
+    sus_mode = S.sus_mode,
+    inversion = S.inversion,
+    voicing_mode = S.voicing,
+    add_bass = S.add_bass,
+    spread = S.spread
+  })
+  return notes, symbol, qual, name_root_midi
+end
+
 local function handle_note_on(canon, root_note, vel, deg)
-  -- Defensive: if this root is already active, turn it off first to avoid overlaps
   if S.chord_active[root_note] then
     for _,n in ipairs(S.chord_active[root_note]) do fanout_note_off(canon, n) end
     S.chord_active[root_note] = nil
   end
 
-  local chord, qual, name_root_midi = chord_for_degree(root_note, deg, S.chord_type, S.inversion, S.spread, S.sus_mode)
+  local chord, symbol = build_chord_and_symbol(root_note, deg)
   S.last_voiced_notes = {}; for i,n in ipairs(chord) do S.last_voiced_notes[i] = n end
   S.last_bass_note = chord[1]
-
-  -- NEW: record emitted notes for this root key
   S.chord_active[root_note] = { table.unpack(chord) }
 
-  S.last_chord_name = build_chord_display_name(chord, qual, name_root_midi); S.last_name_time = now()
+  S.last_chord_name = symbol; S.last_name_time = now()
 
-  -- notify Arp (refresh + key down; restarts phase per spec)
+  -- notify Arp (refresh + key down)
   Arp.refresh()
   Arp.chord_key(true)
 
   local order = make_strum_order(#chord)
   local offs  = compute_step_offsets(#order)
 
-  local sorted = clone_sorted(chord)
+  local sorted = (function(t) local c={}; for i,n in ipairs(t) do c[i]=n end; table.sort(c); return c end)(chord)
   local idx_in_sorted = {}; for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
   local n_sorted = #sorted
 
@@ -1202,8 +1042,8 @@ local function handle_note_on(canon, root_note, vel, deg)
 
   for k,idx in ipairs(order) do
     local n = chord[idx]
-    local s = (offs[k-1] or 0) + jitter_steps(S.humanize_steps_max)
-    local v_base = jitter_velocity(vel, S.humanize_vel_range)
+    local s = (offs[k-1] or 0) + math.random(0, S.humanize_steps_max or 0)
+    local v_base = util.clamp((vel or 100) + math.random(-(S.humanize_vel_range or 0),(S.humanize_vel_range or 0)), 1, 127)
     local pos_in_sorted = idx_in_sorted[n] or 1
     local v = apply_velocity_profile(k, #order, v_base, pos_in_sorted, n_sorted)
 
@@ -1228,14 +1068,10 @@ local function handle_note_on(canon, root_note, vel, deg)
 end
 
 local function handle_note_off(canon, root_note)
-  -- notify Arp (key up)
   Arp.chord_key(false)
-
   if (params:get("chorder_hold_strum") or 1) == 2 then
     S.chord_hold_tokens[root_note] = nil
   end
-
-  -- NEW: turn off exactly what we turned on
   local notes = S.chord_active[root_note]
   if notes then
     for _,n in ipairs(notes) do fanout_note_off(canon, n) end
@@ -1248,7 +1084,7 @@ local function free_handle_note_on(in_note, in_vel)
   local play_vel = (S.free.velocity_mode == 1) and S.free.fixed_velocity or util.clamp(in_vel or 100, 1, 127)
   local fcanon = S.canonical_names[S.free.voice_index] or ""
 
-  -- ===== CHROMATIC (mono only, no quantize) =====
+  -- Chromatic mono (unchanged)
   if S.free.key_mode == 3 then
     local base = util.clamp(in_note + 12 * (S.free.transpose_oct or 0), 0, 127)
     S.free.active_map[in_note] = base
@@ -1257,20 +1093,17 @@ local function free_handle_note_on(in_note, in_vel)
     return
   end
 
-  -- ===== DIATONIC / QUANTIZED MODES =====
   local sc = scale128()
   local deg, base
 
   if S.free.key_mode == 1 then
-    -- White keys → diatonic degrees (ignore black keys)
     local pc = in_note % 12
     local d = K.WHITE_TO_DEG[pc]; if not d then return end
     deg = d
-    local i_deg = nearest_index_with_degree(sc, in_note, deg)
+    local i_deg = chordlib.nearest_index_with_degree(sc, in_note, deg)
     base = sc[util.clamp(i_deg, 1, #sc)]
   else
-    -- key_mode == 2 → all keys quantized to nearest scale tone
-    local qn, qi = Free.quantize_to_scale(in_note)
+    local qn, qi = chordlib.quantize_to_scale(sc, in_note)
     deg = 1 + ((qi - 1) % 7)
     base = qn
   end
@@ -1278,23 +1111,35 @@ local function free_handle_note_on(in_note, in_vel)
   base = util.clamp(base + 12 * (S.free.transpose_oct or 0), 0, 127)
 
   if S.free.mode == 1 then
-    -- MONO
     S.free.active_map[in_note] = base
     Free.fanout_on(fcanon, base, play_vel)
     Free.gate_for(base)
     return
   end
 
-  -- CHORD (uses free recipe, still independent of chord voice)
+  -- Free chord (reuses chordlib)
   local save_voicing, save_add = S.voicing, S.add_bass
   S.voicing, S.add_bass = S.free.voicing, (S.free.add_bass == 2)
   local free_chord_type = (S.free.seventh == 2) and 2 or 1
-  local free_chord_notes, qual, name_root_midi = chord_for_degree(base, deg, free_chord_type, S.free.inversion, S.free.spread, 1)
+
+  local notes, qual, name_root_midi = chordlib.build_chord{
+    scale = sc,
+    base_midi = base,
+    degree = deg,
+    chord_type = free_chord_type,
+    inversion = S.free.inversion,
+    spread = S.free.spread,
+    sus_mode = 1,
+    voicing_mode = S.free.voicing,
+    add_bass = (S.free.add_bass == 2),
+    last_voiced_notes = nil,
+    last_bass_note = nil
+  }
   S.voicing, S.add_bass = save_voicing, save_add
 
-  table.sort(free_chord_notes)
-  local ord = (#free_chord_notes > 1 and S.free.strum_steps > 0) and Free.make_order(#free_chord_notes)
-              or (function(n) local t = {}; for i = 1, n do t[i] = i end; return t end)(#free_chord_notes)
+  table.sort(notes)
+  local ord = (#notes > 1 and S.free.strum_steps > 0) and Free.make_order(#notes)
+              or (function(n) local t = {}; for i = 1, n do t[i] = i end; return t end)(#notes)
   local offs = Free.step_offs(#ord)
 
   local hold_on = (params:get("free_hold_strum") or 1) == 2
@@ -1303,7 +1148,7 @@ local function free_handle_note_on(in_note, in_vel)
 
   local emitted = {}
   for k, idx in ipairs(ord) do
-    local n = free_chord_notes[idx]
+    local n = notes[idx]
     local s = offs[k] or 0
     free_schedule(s, function()
       if (not hold_on) or (S.free.hold_tokens[in_note] == tid) then
@@ -1313,36 +1158,19 @@ local function free_handle_note_on(in_note, in_vel)
     end)
     emitted[#emitted + 1] = n
   end
-
   S.free.chord_active[in_note] = emitted
 
   -- HUD label for Free chord
-  do
-    local root_pc_val = name_root_midi % 12
-    local symbol = base_chord_symbol(root_pc_val, qual, free_chord_type, 1)
-    local bass = free_chord_notes[1]; for i = 2, #free_chord_notes do if free_chord_notes[i] < bass then bass = free_chord_notes[i] end end
-    local bass_pc = bass % 12
-    if bass_pc ~= root_pc_val then
-      symbol = symbol .. "/" .. K.NOTE_NAMES_SHARP[bass_pc + 1]
-    end
-    local tags = {}
-    if S.free.inversion > 0 and (S.free.voicing ~= 11) then table.insert(tags, "inv"..S.free.inversion) end
-    if     S.free.voicing == 2 then table.insert(tags, "drop2")
-    elseif S.free.voicing == 3 then table.insert(tags, "drop3")
-    elseif S.free.voicing == 4 then table.insert(tags, "drop2&4")
-    elseif S.free.voicing == 5 then table.insert(tags, "drop1")
-    elseif S.free.voicing == 6 then table.insert(tags, "open")
-    elseif S.free.voicing == 7 then table.insert(tags, "wide")
-    elseif S.free.voicing == 8 then table.insert(tags, "quartal")
-    elseif S.free.voicing == 9 then table.insert(tags, "quintal")
-    elseif S.free.voicing == 10 then table.insert(tags, "nearest")
-    elseif S.free.voicing == 11 then table.insert(tags, "smooth") end
-    if (S.free.add_bass == 2) and bass_pc == root_pc_val then table.insert(tags, "bass") end
-    if S.free.spread ~= 0 then local sgn = (S.free.spread > 0) and ("+"..S.free.spread) or tostring(S.free.spread); table.insert(tags, "spread"..sgn) end
-    if #tags > 0 then symbol = symbol .. " (" .. table.concat(tags, ", ") .. ")" end
-    S.free.last_name = symbol
-    S.free.last_time = util.time()
-  end
+  local symbol = chordlib.symbol_for(notes, qual, name_root_midi, {
+    chord_type = free_chord_type,
+    sus_mode = 1,
+    inversion = S.free.inversion,
+    voicing_mode = S.free.voicing,
+    add_bass = (S.free.add_bass == 2),
+    spread = S.free.spread
+  })
+  S.free.last_name = symbol
+  S.free.last_time = util.time()
 end
 
 local function free_handle_note_off(in_note)
