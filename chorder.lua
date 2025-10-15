@@ -9,6 +9,7 @@ engine.name = "MxSamples"
 local musicutil = require "musicutil"
 local mxsamples = include "mx.samples/lib/mx.samples"
 local chordlib  = include "lib/chordlib"
+local Strum     = include "lib/strum"   -- moved Strum to its own module
 
 -- ===== config =====
 local BASE = _path.audio .. "mx.samples"
@@ -194,12 +195,25 @@ local MX = (function()
     if not ok then print("mx:on error: "..tostring(err).." (name='"..canon_name.."')") end
   end
 
+  -- Arp-safe MX monitor that uses the chord mx volume
+  local function mx_on_safe_arp(canon_name, midi_note, vel127)
+    canon_name = canon_name or ""; if canon_name=="" then return end
+    local ok, err = pcall(function()
+      S.mx:on({
+        name = canon_name, midi = midi_note, velocity = util.clamp(vel127,1,127),
+        amp = S.mx_vol_pct / 100, gain = S.mx_vol_pct / 100
+      })
+    end)
+    if not ok then print("mx:on (arp) error: "..tostring(err).." (name='"..canon_name.."')") end
+  end
+
   return {
     scan = scan_instruments,
     ensure_loaded = ensure_selected_loaded,
     load_folder = load_folder_into_helper,
     on_chord = mx_on_safe_chord,
     on_free  = mx_on_safe_free,
+    on_arp   = mx_on_safe_arp,
     off      = private_mx_off,
   }
 end)()
@@ -235,6 +249,9 @@ local MIDI = (function()
     end
   end
 
+  private_midi_build_out = build_midi_device_list_awake
+  private_midi_build_in  = build_midi_in_device_list_awake
+
   local function setup_midi_out_awake(param_index)
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
     if S.midi.out then S.midi.out.event = nil; S.midi.out = nil end
@@ -252,6 +269,9 @@ local MIDI = (function()
     active_on(n)
   end
 
+  private_midi_setup_out = setup_midi_out_awake
+  private_midi_on        = midi_out_on_awake
+
   local function all_midi_notes_off()
     if not S.midi.out then active_clear(); return end
     for n,_ in pairs(S.midi.active_notes) do pcall(function() S.midi.out:note_off(n, 0, S.midi.channel) end) end
@@ -265,6 +285,9 @@ local MIDI = (function()
     local bpm = clock.get_tempo()
     return (60 / bpm) * (S.tick_div or 1/4) * frac
   end
+
+  private_midi_setup_out = setup_midi_out_awake
+  private_midi_on        = midi_out_on_awake
 
   local function schedule_gate_for_note(note)
     local secs = compute_gate_seconds()
@@ -280,10 +303,10 @@ local MIDI = (function()
   end
 
   return {
-    build_out = build_midi_device_list_awake,
-    build_in  = build_midi_in_device_list_awake,
-    setup_out = setup_midi_out_awake,
-    on        = midi_out_on_awake,
+    build_out = private_midi_build_out,
+    build_in  = private_midi_build_in,
+    setup_out = private_midi_setup_out,
+    on        = private_midi_on,
     off_all   = all_midi_notes_off,
     gate_for  = schedule_gate_for_note,
   }
@@ -293,173 +316,6 @@ end)()
 local function scale128()
   return chordlib.build_scale(S.root_midi, S.scale_name)
 end
-
--- ===== Strum module =====
-local Strum = (function()
-  local function reverse_inplace(t)
-    local i, j = 1, #t
-    while i < j do
-      t[i], t[j] = t[j], t[i]
-      i = i + 1
-      j = j - 1
-    end
-  end
-
-  local function shuffle_inplace(t)
-    for i = #t, 2, -1 do
-      local j = math.random(1, i)
-      t[i], t[j] = t[j], t[i]
-    end
-  end
-
-  local function center_out(n)
-    local seq = {}
-    local lo = math.floor((n + 1) / 2)
-    local hi = lo + 1
-    if n % 2 == 1 then
-      table.insert(seq, lo)
-      while (#seq < n) do
-        if hi <= n then table.insert(seq, hi) end
-        local left = lo - ((#seq % 2 == 0) and 0 or 1)
-        if left >= 1 and #seq < n then table.insert(seq, left) end
-        hi = hi + 1
-      end
-    else
-      local a, b = n / 2, n / 2 + 1
-      table.insert(seq, a)
-      table.insert(seq, b)
-      local step = 1
-      while #seq < n do
-        local l = a - step
-        local r = b + step
-        if l >= 1 then table.insert(seq, l) end
-        if r <= n and #seq < n then table.insert(seq, r) end
-        step = step + 1
-      end
-    end
-    return seq
-  end
-
-  local function outside_in(n)
-    local seq = {}
-    local i, j = 1, n
-    while i <= j do
-      table.insert(seq, i)
-      if i ~= j then table.insert(seq, j) end
-      i = i + 1
-      j = j - 1
-    end
-    return seq
-  end
-
-  local function edge_kiss(n) return outside_in(n) end
-
-  local function ping_pair(n)
-    local seq = {}
-    local L, R = 1, n
-    while L < R do
-      table.insert(seq, L)
-      if L + 1 <= R then table.insert(seq, L + 1) end
-      if R - 1 >= L + 2 then table.insert(seq, R - 1) end
-      table.insert(seq, R)
-      L = L + 2
-      R = R - 2
-    end
-    if L == R then table.insert(seq, L) end
-    return seq
-  end
-
-  local function arp_chunk_2_3(n, up)
-    local base = {}
-    if up then for i = 1, n do base[#base + 1] = i end
-    else for i = n, 1, -1 do base[#base + 1] = i end end
-    local seq, i, toggle = {}, 1, true
-    while i <= #base do
-      local sz = toggle and 2 or 3
-      for k = i, math.min(i + sz - 1, #base) do seq[#seq + 1] = base[k] end
-      i = i + sz
-      toggle = not toggle
-    end
-    return seq
-  end
-
-  local function guitar_rake(n, up)
-    local seq = {}
-    if up then for i = 1, n do seq[#seq + 1] = i end
-    else for i = n, 1, -1 do seq[#seq + 1] = i end end
-    return seq
-  end
-
-  local function harp_gliss_split(n)
-    local mid = math.floor(n / 2)
-    local lo = {}; for i = 1, mid do lo[#lo + 1] = i end
-    local hi = {}; for i = mid + 1, n do hi[#hi + 1] = i end
-    local seq = {}
-    for i = 1, #lo do seq[#seq + 1] = lo[i] end
-    for i = 1, #hi do seq[#seq + 1] = hi[i] end
-    return seq
-  end
-
-  local function harp_gliss_split_interleaved(n)
-    local mid = math.floor(n / 2)
-    local lo, hi = {}, {}
-    for i = 1, mid do lo[#lo + 1] = i end
-    for i = mid + 1, n do hi[#hi + 1] = i end
-    local seq, i = {}, 1
-    while i <= math.max(#lo, #hi) do
-      if i <= #lo then seq[#seq + 1] = lo[i] end
-      if i <= #hi then seq[#seq + 1] = hi[i] end
-      i = i + 1
-    end
-    return seq
-  end
-
-  local function make(count, stype, state)
-    state = state or { alt_flip = false, last_first = nil, last_last = nil }
-    local order = {}
-    for i = 1, math.max(count or 0, 0) do order[i] = i end
-    local n = #order
-    if n <= 1 then return order, state end
-
-    if     stype == 1  then return order, state
-    elseif stype == 2  then reverse_inplace(order); return order, state
-    elseif stype == 3  then if state.alt_flip then reverse_inplace(order) end; state.alt_flip = not state.alt_flip; return order, state
-    elseif stype == 4  then if not state.alt_flip then reverse_inplace(order) end; state.alt_flip = not state.alt_flip; return order, state
-    elseif stype == 5  then shuffle_inplace(order); state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-    elseif stype == 6  then local seq = center_out(n); for k = 1, n do order[k] = seq[k] end; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-    elseif stype == 7  then local seq = outside_in(n); for k = 1, n do order[k] = seq[k] end; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-    elseif stype == 8  then local seq = outside_in(n); for k = 1, n do order[k] = seq[k] end; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-    elseif stype == 9  then local seq = outside_in(n); reverse_inplace(seq); for k = 1, n do order[k] = seq[k] end; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-    elseif stype == 10 then local tries = 0; repeat shuffle_inplace(order); tries = tries + 1 until (order[1] ~= state.last_first) or tries > 8; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-    elseif stype == 11 then
-      if state.last_first and state.last_last and n >= 3 then
-        local middle = {}
-        for i = 1, n do if i ~= state.last_first and i ~= state.last_last then middle[#middle + 1] = i end end
-        shuffle_inplace(middle)
-        local out = { state.last_first }
-        for i = 1, #middle do out[#out + 1] = middle[i] end
-        out[#out + 1] = state.last_last
-        return out, state
-      end
-      shuffle_inplace(order)
-      state.last_first = order[1]
-      state.last_last  = order[#order]
-      return order, state
-    elseif stype == 12 then return edge_kiss(n), state
-    elseif stype == 13 then return ping_pair(n), state
-    elseif stype == 14 then return arp_chunk_2_3(n, true), state
-    elseif stype == 15 then return guitar_rake(n, true), state
-    elseif stype == 16 then return harp_gliss_split(n), state
-    elseif stype == 17 then return arp_chunk_2_3(n, false), state
-    elseif stype == 18 then return guitar_rake(n, false), state
-    elseif stype == 19 then return harp_gliss_split_interleaved(n), state
-    end
-
-    return order, state
-  end
-
-  return { make = make }
-end)()
 
 -- ===== Arp module =====
 local Arp = (function()
@@ -474,7 +330,6 @@ local Arp = (function()
     mout = nil,                -- dedicated MIDI out (can be nil to use chord OUT)
   }
 
-  -- --- Output routing (own device/voice) ---
   local function want_mx()
     local mval = params:get("arp_out_mode") or 1
     return (mval==1) or (mval==2)
@@ -485,31 +340,27 @@ local Arp = (function()
   end
 
   local function setup_midi_out(param_index_in_s_midi_devices)
-    -- param_index_in_s_midi_devices is 1..#S.midi.devices (no sentinel)
     local real_port = S.midi.ports_map[param_index_in_s_midi_devices] or 1
     if A.mout then A.mout.event = nil; A.mout = nil end
     A.mout = midi.connect(real_port)
     if A.mout then print("ARP MIDI OUT: "..(midi.vports[real_port].name or ("port "..real_port))) end
   end
 
-  -- SMART FANOUT with fallback: if MIDI requested but unavailable, still monitor via mx
+  -- SMART FANOUT with fallback
   local function fanout_on(note, vel)
     local canon = S.canonical_names[params:get("arp_mx_voice") or 1] or ""
-    -- send MIDI if requested and available
     local sent_midi = false
     if want_midi() then
       local ch = params:get("arp_midi_out_ch") or 1
-      local dev = A.mout or S.midi.out  -- fallback to chord MIDI out when Arp device sentinel is selected
+      local dev = A.mout or S.midi.out
       if not dev then print("ARP: want_midi() but no MIDI device (A.mout=nil and S.midi.out=nil)") end
-      print(string.format("ARP SEND on: note=%d vel=%d ch=%d midi=%s", note, vel, ch, dev and "yes" or "no"))
       if dev then
         pcall(function() dev:note_on(util.clamp(note,0,127), util.clamp(vel,1,127), ch) end)
         sent_midi = true
       end
     end
-    -- smart fallback monitor to mx if (a) mx is enabled OR (b) MIDI-only was requested but nothing actually sent
     if want_mx() or (want_midi() and not sent_midi) then
-      MX.on_free(canon, note, util.clamp(vel,1,127))
+      MX.on_arp(canon, note, util.clamp(vel,1,127))
     end
   end
   local function fanout_off(note)
@@ -518,7 +369,6 @@ local Arp = (function()
     if want_midi() then
       local ch = params:get("arp_midi_out_ch") or 1
       local dev = A.mout or S.midi.out
-      print(string.format("ARP SEND off: note=%d ch=%d midi=%s", note, ch, dev and "yes" or "no"))
       if dev then
         pcall(function() dev:note_off(util.clamp(note,0,127), 0, ch) end)
         turned_off_midi = true
@@ -530,7 +380,6 @@ local Arp = (function()
   end
   local function all_off() for n,_ in pairs(A.emitted) do fanout_off(n) end; A.emitted = {} end
 
-  -- --- Material (chord tones + optional passing) ---
   local function scale_between(a,b, sc)
     local lo, hi = math.min(a,b), math.max(a,b)
     local out = {}
@@ -539,18 +388,16 @@ local Arp = (function()
   end
 
   local function make_material()
-    -- ENFORCEMENT: do not auto-generate arp material until a chord has been played
     local base_notes = {}
     if type(S.last_voiced_notes)=="table" and #S.last_voiced_notes>0 then
       for _,n in ipairs(S.last_voiced_notes) do base_notes[#base_notes+1]=n end
     else
-      -- No chord captured yet -> keep material empty so arp stays silent
       A.notes_buf = {}
       return
     end
     table.sort(base_notes)
 
-    local mode = params:get("arp_material") or 2 -- 1=chord only, 2=chord + passing (default)
+    local mode = params:get("arp_material") or 2 -- 1=chord only, 2=chord + passing
     if mode == 1 then A.notes_buf = base_notes; return end
 
     local sc = scale128()
@@ -567,7 +414,6 @@ local Arp = (function()
     A.notes_buf = buf
   end
 
-  -- --- Order / walk ---
   local function build_order()
     local stype = params:get("arp_order") or 1
     return select(1, Strum.make(#A.notes_buf, stype, A.ord_state)) or {}
@@ -577,7 +423,7 @@ local Arp = (function()
     local idx = ord[((step_idx-1) % #ord) + 1]
     local base = A.notes_buf[idx]
     local span = params:get("arp_octaves") or 1
-    local walk = params:get("arp_oct_walk") or 1 -- 1=wrap (default), 2=bounce
+    local walk = params:get("arp_oct_walk") or 1 -- 1=wrap, 2=bounce
     local t = math.floor((step_idx-1)/#ord)
     local o
     if span<=0 then o=0
@@ -593,7 +439,6 @@ local Arp = (function()
     return util.clamp(base + o*12, 0, 127)
   end
 
-  -- --- Timing / gate / swing (separate from chord) ---
   local function step_seconds()
     local div = K.QUANT_DIV_MAP[K.QUANT_DIV_OPTS[params:get("arp_div") or 6] or "1/8"] or 1/8
     local bpm = clock.get_tempo()
@@ -624,7 +469,6 @@ local Arp = (function()
     A.step_i = A.step_i + 1
   end
 
-  -- --- Lifecycle ---
   local function run()
     A.running = true
     A.step_i  = 1
@@ -654,14 +498,12 @@ local Arp = (function()
     all_off()
   end
 
-  -- chord-key notifications (for key-held mode or latch restart)
   local function chord_key(down)
     local mode = params:get("arp_trigger_mode") or 1 -- 1=key-held, 2=latch
     if mode==2 then
       if down then make_material(); A.step_i=1; start() end
       return
     end
-    -- key-held:
     if down then
       A.hold_count = A.hold_count + 1
       make_material(); A.step_i=1
@@ -674,7 +516,6 @@ local Arp = (function()
 
   local function hotplug_refresh()
     local sel = params:get("arp_midi_out_dev") or 1
-    -- sel==1 is sentinel "(use Chord MIDI out)"
     if sel == 1 then
       A.mout = nil
       print("ARP MIDI OUT: using Chord MIDI out (sentinel)")
@@ -683,10 +524,8 @@ local Arp = (function()
     end
   end
 
-  return {
-    start=start, stop=stop, refresh=make_material, chord_key=chord_key,
-    setup_midi_out=setup_midi_out, hotplug_refresh=hotplug_refresh
-  }
+  return { start=start, stop=stop, refresh=make_material, chord_key=chord_key,
+           setup_midi_out=setup_midi_out, hotplug_refresh=hotplug_refresh }
 end)()
 
 -- ===== Chord timing & shaping =====
@@ -815,13 +654,11 @@ local Free = (function()
     if free_want_midi() then free_note_off_midi(note) end
   end
 
-  -- quantize note to current scale (uses chordlib)
   local function quantize_to_scale(note)
     local sc = chordlib.build_scale(S.root_midi, S.scale_name)
     return chordlib.quantize_to_scale(sc, note)
   end
 
-  -- ----- timing shapes for Free -----
   local function free_compute_step_offsets(m)
     local base = math.max(0, S.free.strum_steps or 0)
     local offs = {}
@@ -872,7 +709,6 @@ local Free = (function()
     return ord or {}
   end
 
-  -- MIDI gate scheduling for Free
   local function free_compute_gate_seconds()
     local sel = S.free.gate_mode or 1
     if sel == 1 then return nil end
@@ -892,7 +728,6 @@ local Free = (function()
     end)
   end
 
-  -- HUD helpers
   local function free_active_notes_ascending()
     local t = {}
     for _,q in pairs(S.free.active_map) do t[#t+1] = q end
@@ -919,7 +754,6 @@ local Free = (function()
     quantize_to_scale = quantize_to_scale,
   }
 end)()
-
 
 -- ===== Event queue / clock =====
 local function queue_in_steps(steps, fn) table.insert(S.evq, {steps=math.max(0, steps), fn=fn}) end
@@ -952,7 +786,6 @@ local function panic_all_outputs()
   if S.mx and S.mx.all_notes_off then pcall(function() S.mx:all_notes_off() end) end
   MIDI.off_all()
 
-  -- NEW: chord voice active-offs
   do
     local canon = S.canonical_names[S.voice_index] or ""
     for _,notes in pairs(S.chord_active) do
@@ -961,20 +794,17 @@ local function panic_all_outputs()
     S.chord_active = {}
   end
 
-  -- free off
   local fcanon = S.canonical_names[S.free.voice_index] or ""
   S.free.hold_tokens = {}
   for _,q in pairs(S.free.active_map) do Free.fanout_off(fcanon, q) end
   for _,outs in pairs(S.free.chord_active) do for _,n in ipairs(outs) do Free.fanout_off(fcanon, n) end end
   S.free.active_map = {}; S.free.chord_active = {}
 
-  -- arp off
   Arp.stop()
 end
 
 -- ===== Chord voice handlers =====
 local strum_state = { alt_flip=false, last_first=nil, last_last=nil }
-
 local function make_strum_order(count)
   local ord, ns = Strum.make(count, S.strum_type, strum_state)
   strum_state = ns
@@ -1020,7 +850,6 @@ local function handle_note_on(canon, root_note, vel, deg)
 
   S.last_chord_name = symbol; S.last_name_time = now()
 
-  -- notify Arp (refresh + key down)
   Arp.refresh()
   Arp.chord_key(true)
 
@@ -1084,7 +913,6 @@ local function free_handle_note_on(in_note, in_vel)
   local play_vel = (S.free.velocity_mode == 1) and S.free.fixed_velocity or util.clamp(in_vel or 100, 1, 127)
   local fcanon = S.canonical_names[S.free.voice_index] or ""
 
-  -- Chromatic mono (unchanged)
   if S.free.key_mode == 3 then
     local base = util.clamp(in_note + 12 * (S.free.transpose_oct or 0), 0, 127)
     S.free.active_map[in_note] = base
@@ -1117,7 +945,6 @@ local function free_handle_note_on(in_note, in_vel)
     return
   end
 
-  -- Free chord (reuses chordlib)
   local save_voicing, save_add = S.voicing, S.add_bass
   S.voicing, S.add_bass = S.free.voicing, (S.free.add_bass == 2)
   local free_chord_type = (S.free.seventh == 2) and 2 or 1
@@ -1160,7 +987,6 @@ local function free_handle_note_on(in_note, in_vel)
   end
   S.free.chord_active[in_note] = emitted
 
-  -- HUD label for Free chord
   local symbol = chordlib.symbol_for(notes, qual, name_root_midi, {
     chord_type = free_chord_type,
     sus_mode = 1,
@@ -1364,14 +1190,12 @@ local function setup_midi_in(param_index)
   S.midi.input.event = function(data)
     local msg = midi.to_msg(data); if not msg then return end
 
-    -- chord input channel filter (supports omni)
     local chord_ok
     do
       local ch_sel_idx = params:get(S.midi.in_ch_param)
       chord_ok = (ch_sel_idx == 1) or (msg.ch == (ch_sel_idx - 1))
     end
 
-    -- free play input channel (explicit 1..16; default 2)
     local free_ok
     do
       local free_ch = params:get(S.free.midi_in_ch_param) or 2
@@ -1382,7 +1206,6 @@ local function setup_midi_in(param_index)
     local chord_vel = (S.velocity_mode == 2 and (msg.vel or S.fixed_velocity) or S.fixed_velocity)
 
     if msg.type == "note_on" and msg.vel > 0 then
-      -- CHORD voice (white keys = diatonic degrees)
       if chord_ok then
         MX.ensure_loaded(S.voice_index)
         local pc = msg.note % 12
@@ -1392,7 +1215,6 @@ local function setup_midi_in(param_index)
         end
       end
 
-      -- FREE PLAY (mode depends on free_key_mode)
       if S.free.enable and free_ok then
         local vel = (S.free.velocity_mode == 1) and S.free.fixed_velocity or msg.vel
         free_handle_note_on(msg.note, vel)
@@ -1420,9 +1242,8 @@ local function rebind_midi_in_if_needed()
   end
 end
 
--- Helper to build Arp device options with sentinel
 local function arp_device_options()
-  local t = {"(use Chord MIDI out)"} -- sentinel index 1
+  local t = {"(use Chord MIDI out)"}
   for i=1,#S.midi.devices do t[#t+1] = S.midi.devices[i] end
   return t
 end
@@ -1450,7 +1271,6 @@ local function rebuild_midi_lists()
   local p_free_out = params:lookup_param(S.free.midi_out_dev_param)
   if p_free_out then p_free_out.options = S.midi.devices; p_free_out.count = #S.midi.devices end
 
-  -- also refresh Arp device list combo (with sentinel)
   params:hide("arp_midi_out_dev"); params:show("arp_midi_out_dev")
   local p_arp_out = params:lookup_param("arp_midi_out_dev")
   if p_arp_out then
@@ -1501,7 +1321,6 @@ local function add_arp_section()
     div("Output"),
     function()
       params:add_option("arp_out_mode", "output", {"mx.samples","mx.samples + MIDI","MIDI"}, 1)
-      -- When output mode changes, refresh arp routing so fallback logic is accurate right away
       params:set_action("arp_out_mode", function(_) Arp.hotplug_refresh() end)
     end,
     function()
@@ -1510,17 +1329,15 @@ local function add_arp_section()
     end,
     function()
       params:add_option("arp_midi_out_dev", "MIDI out", (function()
-        local t = {"(use Chord MIDI out)"} -- sentinel at index 1
+        local t = {"(use Chord MIDI out)"} -- sentinel
         for i=1,#S.midi.devices do t[#t+1] = S.midi.devices[i] end
         return t
       end)(), 1)
       params:set_action("arp_midi_out_dev", function(i)
         if i == 1 then
-          -- sentinel: use Chord MIDI out
           print("ARP MIDI OUT: using Chord MIDI out")
-          -- keep A.mout=nil; fanout uses fallback S.midi.out
         else
-          Arp.setup_midi_out(i - 1) -- shift for sentinel
+          Arp.setup_midi_out(i - 1)
         end
       end)
     end,
@@ -1549,7 +1366,6 @@ function init()
     return 1
   end)(DEFAULT_MIDI_IN_NAME)
 
-  -- === SECTION 1: CHORDER · I/O ===
   local g_io = {
     div("Output"),
     function()
@@ -1614,7 +1430,6 @@ function init()
           pf.count   = (#S.display_names>0 and #S.display_names or 1)
           S.free.voice_index = 1; params:set("free_mx_voice", S.free.voice_index)
         end
-        -- also refresh Arp voice options
         local pa = params:lookup_param("arp_mx_voice")
         if pa then
           pa.options = (#S.display_names>0 and S.display_names or {"(no packs)"})
@@ -1632,7 +1447,6 @@ function init()
   }
   add_section("CHORDER · I/O", g_io)
 
-  -- === SECTION 2: CHORDER · Musical Setup ===
   local VOICE_OPTS = {
     "none","drop-2","drop-3","drop-2&4","drop-1",
     "open","wide","quartal","quintal","nearest","smooth"
@@ -1698,7 +1512,6 @@ function init()
   }
   add_section("CHORDER · Musical Setup", g_setup)
 
-  -- === SECTION 3: CHORDER · Timing & Feel ===
   local g_timing = {
     div("Clock & Grid"),
     function()
@@ -1763,7 +1576,6 @@ function init()
   }
   add_section("CHORDER · Timing & Feel", g_timing)
 
-  -- === SECTION 4: CHORDER · Free Play ===
   local g_free = {
     div("Toggle"),
     function()
@@ -1892,15 +1704,12 @@ function init()
   }
   add_section("CHORDER · Free Play", g_free)
 
-  -- === SECTION 5: CHORDER · Arpeggio ===
   add_arp_section()
 
-  -- Hotplug
   midi.add = function(dev)
     print("MIDI added: "..(dev.name or "?"))
     rebuild_midi_lists()
     Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
-    -- Respect sentinel for Arp:
     Arp.hotplug_refresh()
   end
   midi.remove = function(dev)
@@ -1909,11 +1718,9 @@ function init()
     setup_midi_in(params:get(S.midi.in_dev_param) or default_midi_in_index)
     MIDI.setup_out(params:get(S.midi.out_dev_param) or 1)
     Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
-    -- Respect sentinel for Arp:
     Arp.hotplug_refresh()
   end
 
-  -- initial visibility
   show_param("chorder_swing_pct", S.swing_mode == 2)
   show_param("chorder_vel_fixed", S.velocity_mode == 1)
   show_param("chorder_inversion", S.voicing ~= 11)
@@ -1924,14 +1731,12 @@ function init()
   update_arp_visibility()
   params:set_action("arp_out_mode", function(_) update_arp_visibility(); Arp.hotplug_refresh() end)
 
-  -- clock & devices
   recompute_root_midi()
   clock.run(clock_loop)
 
   MX.ensure_loaded(S.voice_index)
   MIDI.setup_out(1)
   Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
-  -- Respect sentinel selection at boot:
   Arp.hotplug_refresh()
   setup_midi_in(params:get(S.midi.in_dev_param) or default_midi_in_index)
   rebind_midi_in_if_needed()
@@ -1956,7 +1761,7 @@ function key(n, z)
         S.page = (S.page == S.PAGE_HUD) and S.PAGE_CHORD or S.PAGE_HUD
         redraw()
       else
-        panic_all_outputs() -- K3 short press: panic
+        panic_all_outputs()
       end
     end
   end
