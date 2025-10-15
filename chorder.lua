@@ -9,7 +9,8 @@ engine.name = "MxSamples"
 local musicutil = require "musicutil"
 local mxsamples = include "mx.samples/lib/mx.samples"
 local chordlib  = include "lib/chordlib"
-local Strum     = include "lib/strum"   -- moved Strum to its own module
+local Strum     = include "lib/strum"    -- moved Strum to its own module
+local Timing    = include "lib/timing"   -- NEW: factored timing helpers
 
 -- ===== config =====
 local BASE = _path.audio .. "mx.samples"
@@ -238,6 +239,8 @@ local MIDI = (function()
     end
   end
 
+  private_midi_build_out = build_midi_device_list_awake
+
   local function build_midi_in_device_list_awake()
     S.midi.in_devices = {"none"}
     S.midi.in_ports_map = { [1] = 0 }
@@ -249,7 +252,6 @@ local MIDI = (function()
     end
   end
 
-  private_midi_build_out = build_midi_device_list_awake
   private_midi_build_in  = build_midi_in_device_list_awake
 
   local function setup_midi_out_awake(param_index)
@@ -260,6 +262,8 @@ local MIDI = (function()
     else print("MIDI OUT: connect failed for port "..real_port) end
   end
 
+  private_midi_setup_out = setup_midi_out_awake
+
   local function midi_out_on_awake(note, vel127)
     if not S.midi.out then return end
     local vel = util.clamp(vel127, 1, 127)
@@ -269,7 +273,6 @@ local MIDI = (function()
     active_on(n)
   end
 
-  private_midi_setup_out = setup_midi_out_awake
   private_midi_on        = midi_out_on_awake
 
   local function all_midi_notes_off()
@@ -285,9 +288,6 @@ local MIDI = (function()
     local bpm = clock.get_tempo()
     return (60 / bpm) * (S.tick_div or 1/4) * frac
   end
-
-  private_midi_setup_out = setup_midi_out_awake
-  private_midi_on        = midi_out_on_awake
 
   local function schedule_gate_for_note(note)
     local secs = compute_gate_seconds()
@@ -418,6 +418,7 @@ local Arp = (function()
     local stype = params:get("arp_order") or 1
     return select(1, Strum.make(#A.notes_buf, stype, A.ord_state)) or {}
   end
+  private_next_note = nil
   local function next_note(step_idx)
     local ord = build_order(); if #ord==0 then return nil end
     local idx = ord[((step_idx-1) % #ord) + 1]
@@ -438,17 +439,11 @@ local Arp = (function()
     end
     return util.clamp(base + o*12, 0, 127)
   end
+  private_next_note = next_note
 
   local function step_seconds()
     local div = K.QUANT_DIV_MAP[K.QUANT_DIV_OPTS[params:get("arp_div") or 6] or "1/8"] or 1/8
-    local bpm = clock.get_tempo()
-    local base = (60/bpm)*div
-    local sm  = params:get("arp_swing_mode") or 1
-    local pct = (params:get("arp_swing_pct") or 0)/100
-    if sm==2 and pct>0 then
-      if (A.step_i % 2)==1 then return base*(1+pct) else return base*(1-pct) end
-    end
-    return base
+    return Timing.step_seconds(div, clock.get_tempo(), params:get("arp_swing_mode") or 1, params:get("arp_swing_pct") or 0, A.step_i)
   end
 
   local function step_once()
@@ -528,63 +523,6 @@ local Arp = (function()
            setup_midi_out=setup_midi_out, hotplug_refresh=hotplug_refresh }
 end)()
 
--- ===== Chord timing & shaping =====
-local function compute_step_offsets(m)
-  local base = math.max(0, S.strum_steps or 0)
-  if m <= 1 or base == 0 then local offs = {}; for k=1,m do offs[k-1] = 0 end; return offs end
-
-  local shape = params:get("chorder_timing_shape") or 1
-  local amt   = (params:get("chorder_timing_amt") or 50) / 100.0
-  local spacing = {}; for k=1,m-1 do spacing[k] = base end
-
-  local function apply_serpentine()
-    local mid = (m+1)/2
-    for k=1,m-1 do local d = math.abs((k - mid) / mid); spacing[k] = base * (1 + amt * d) end
-  end
-  local function apply_accel()
-    for k=1,m-1 do local t = (k-1)/math.max(1,(m-2)); spacing[k] = math.max(0.1, base * (1 - amt * t)) end
-  end
-  local function apply_rit()
-    for k=1,m-1 do local t = (k-1)/math.max(1,(m-2)); spacing[k] = base * (1 + amt * t) end
-  end
-  local function ease_in_quad(t)  return t*t end
-  local function ease_out_quad(t) return 1 - (1-t)*(1-t) end
-  local function apply_rake(ease_fn)
-    for k=1,m-1 do
-      local t = (k-1)/math.max(1,(m-2)); local w = ease_fn(t)
-      spacing[k] = base * (1 - amt + amt * (1 + (w - 0.5)*2))
-      spacing[k] = math.max(0.1, spacing[k])
-    end
-  end
-  local function apply_skip_alt()
-    local add = params:get("chorder_timing_skip_steps") or 1
-    local add_eff = add * amt
-    for k=1,m-1 do if (k % 2) == 1 then spacing[k] = spacing[k] + add_eff end end
-  end
-
-  if     shape == 2 then apply_serpentine()
-  elseif shape == 3 then apply_accel()
-  elseif shape == 4 then apply_rit()
-  elseif shape == 5 then apply_rake(ease_in_quad)
-  elseif shape == 6 then apply_rake(ease_out_quad)
-  elseif shape == 7 then apply_skip_alt() end
-
-  local offs = {}; local sum = 0; offs[0] = 0
-  for k=1,m-1 do sum = sum + spacing[k]; offs[k] = util.round(sum) end
-  return offs
-end
-
-local function apply_velocity_profile(k, m, base_vel, note_idx_in_sorted, n_sorted)
-  local v = base_vel
-  v = v + (k-1) * (params:get("chorder_ramp_per_step") or 0)
-  local acc_tgt = params:get("chorder_accent") or 1
-  local acc_amt = params:get("chorder_accent_amt") or 0
-  if     acc_tgt == 2 then if note_idx_in_sorted == 1 then v = v + acc_amt end
-  elseif acc_tgt == 3 then if note_idx_in_sorted == n_sorted then v = v + acc_amt end
-  elseif acc_tgt == 4 then local mid = math.ceil(n_sorted/2); if note_idx_in_sorted == mid then v = v + acc_amt end end
-  return util.clamp(math.floor(v), 1, 127)
-end
-
 -- ===== Output helpers (Chord) =====
 local OUT_OPTS = {"mx.samples", "mx.samples + MIDI", "MIDI"}
 local function want_mx()   local mval = params:get(S.out_mode_param) or 1; return (mval==1) or (mval==2) end
@@ -659,48 +597,15 @@ local Free = (function()
     return chordlib.quantize_to_scale(sc, note)
   end
 
+  -- NEW: delegate offsets to Timing (1-based offsets for Free)
   local function free_compute_step_offsets(m)
-    local base = math.max(0, S.free.strum_steps or 0)
-    local offs = {}
-    if m <= 1 or base == 0 then for k=1,m do offs[k] = 0 end; return offs end
-
-    local amt = (S.free.timing_amt or 50) / 100.0
-    local spacing = {}; for k=1,m-1 do spacing[k] = base end
-
-    local function apply_serpentine()
-      local mid = (m+1)/2
-      for k=1,m-1 do local d = math.abs((k - mid) / mid); spacing[k] = base * (1 + amt * d) end
-    end
-    local function apply_accel()
-      for k=1,m-1 do local t = (k-1)/math.max(1,(m-2)); spacing[k] = math.max(0.1, base * (1 - amt * t)) end
-    end
-    local function apply_rit()
-      for k=1,m-1 do local t = (k-1)/math.max(1,(m-2)); spacing[k] = base * (1 + amt * t) end
-    end
-    local function ease_in_quad(t)  return t*t end
-    local function ease_out_quad(t) return 1 - (1-t)*(1-t) end
-    local function apply_rake(ease_fn)
-      for k=1,m-1 do
-        local t = (k-1)/math.max(1,(m-2)); local w = ease_fn(t)
-        spacing[k] = base * (1 - amt + amt * (1 + (w - 0.5)*2))
-        spacing[k] = math.max(0.1, spacing[k])
-      end
-    end
-    local function apply_skip_alt()
-      local add = (S.free.timing_skip_steps or 1) * amt
-      for k=1,m-1 do if (k % 2) == 1 then spacing[k] = spacing[k] + add end end
-    end
-
-    if     S.free.timing_shape == 2 then apply_serpentine()
-    elseif S.free.timing_shape == 3 then apply_accel()
-    elseif S.free.timing_shape == 4 then apply_rit()
-    elseif S.free.timing_shape == 5 then apply_rake(ease_in_quad)
-    elseif S.free.timing_shape == 6 then apply_rake(ease_out_quad)
-    elseif S.free.timing_shape == 7 then apply_skip_alt() end
-
-    local sum = 0
-    for k=1,m do if k == 1 then offs[k] = 0 else sum = sum + util.round(spacing[k-1]); offs[k] = sum end end
-    return offs
+    return Timing.step_offsets_one_index(
+      m,
+      S.free.strum_steps or 0,
+      S.free.timing_shape or 1,
+      S.free.timing_amt or 50,
+      S.free.timing_skip_steps or 1
+    )
   end
 
   local function free_make_strum_order(count)
@@ -854,7 +759,15 @@ local function handle_note_on(canon, root_note, vel, deg)
   Arp.chord_key(true)
 
   local order = make_strum_order(#chord)
-  local offs  = compute_step_offsets(#order)
+
+  -- NEW: use Timing module (zero-index offsets to match original chord path)
+  local offs = Timing.step_offsets_zero_index(
+    #order,
+    S.strum_steps or 0,
+    params:get("chorder_timing_shape") or 1,
+    params:get("chorder_timing_amt") or 50,
+    params:get("chorder_timing_skip_steps") or 1
+  )
 
   local sorted = (function(t) local c={}; for i,n in ipairs(t) do c[i]=n end; table.sort(c); return c end)(chord)
   local idx_in_sorted = {}; for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
@@ -872,9 +785,20 @@ local function handle_note_on(canon, root_note, vel, deg)
   for k,idx in ipairs(order) do
     local n = chord[idx]
     local s = (offs[k-1] or 0) + math.random(0, S.humanize_steps_max or 0)
-    local v_base = util.clamp((vel or 100) + math.random(-(S.humanize_vel_range or 0),(S.humanize_vel_range or 0)), 1, 127)
+
+    local v_base = util.clamp(
+      (vel or 100) + math.random(-(S.humanize_vel_range or 0),(S.humanize_vel_range or 0)),
+      1, 127
+    )
     local pos_in_sorted = idx_in_sorted[n] or 1
-    local v = apply_velocity_profile(k, #order, v_base, pos_in_sorted, n_sorted)
+
+    -- NEW: velocity via Timing module
+    local v = Timing.apply_velocity(
+      k, #order, v_base, pos_in_sorted, n_sorted,
+      params:get("chorder_ramp_per_step") or 0,
+      params:get("chorder_accent") or 1,
+      params:get("chorder_accent_amt") or 0
+    )
 
     schedule(s, function()
       if (not hold_on) or (S.chord_hold_tokens[root_note] == tid) then
