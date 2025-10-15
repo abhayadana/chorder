@@ -1,4 +1,4 @@
--- CHORDER — a three-voice chord+based instrument (single-file refactor A+B)
+-- CHORDER — a three-voice chord+based instrument (single-file refactor A+B + Arp MIDI patches)
 -- Author: @abhayadana (refactor pass by ChatGPT)
 -- Engine: mx.samples and/or MIDI
 --
@@ -36,6 +36,7 @@ local S = {
 
   -- chord state
   last_voiced_notes = nil, last_bass_note = nil,
+  chord_active = {},  -- NEW: per-root record of emitted chord notes
 
   -- display / hud
   last_chord_name = nil, last_name_time = 0, last_name_timeout = 2.0,
@@ -159,6 +160,12 @@ local MX = (function()
     else print("mx.samples: failed to load '"..folder.."' at "..path); return false end
   end
 
+  private_mx_off = function(canon_name, midi_note)
+    canon_name = canon_name or ""; if canon_name=="" then return end
+    local ok, err = pcall(function() S.mx:off({ name = canon_name, midi = midi_note }) end)
+    if not ok then print("mx:off error: "..tostring(err).." (name='"..canon_name.."')") end
+  end
+
   local function ensure_selected_loaded(index)
     local folder = S.folder_names[index or S.voice_index]
     if folder then load_folder_into_helper(folder) end
@@ -186,19 +193,13 @@ local MX = (function()
     if not ok then print("mx:on error: "..tostring(err).." (name='"..canon_name.."')") end
   end
 
-  local function mx_off_safe(canon_name, midi_note)
-    canon_name = canon_name or ""; if canon_name=="" then return end
-    local ok, err = pcall(function() S.mx:off({ name = canon_name, midi = midi_note }) end)
-    if not ok then print("mx:off error: "..tostring(err).." (name='"..canon_name.."')") end
-  end
-
   return {
     scan = scan_instruments,
     ensure_loaded = ensure_selected_loaded,
     load_folder = load_folder_into_helper,
     on_chord = mx_on_safe_chord,
     on_free  = mx_on_safe_free,
-    off      = mx_off_safe,
+    off      = private_mx_off,
   }
 end)()
 
@@ -206,7 +207,7 @@ end)()
 local MIDI = (function()
   local function active_clear() S.midi.active_notes = {} end
   local function active_on(n) S.midi.active_notes[n] = true end
-  private_active_off = function(n) S.midi.active_notes[n] = nil end -- (kept private if needed elsewhere)
+  private_active_off = function(n) S.midi.active_notes[n] = nil end
 
   local function build_midi_device_list_awake()
     S.midi.devices, S.midi.ports_map = {}, {}
@@ -271,7 +272,7 @@ local MIDI = (function()
     clock.run(function()
       clock.sleep(secs)
       if S.midi.active_notes[n] then
-        pcall(function() S.midi.out:note_off(n, 0, S.midi.channel) end)
+        pcall(function() if S.midi.out then S.midi.out:note_off(n, 0, S.midi.channel) end end)
         private_active_off(n)
       end
     end)
@@ -663,7 +664,7 @@ local Arp = (function()
     emitted = {},              -- active note-ons
     coro = nil,
     hold_count = 0,            -- for key-held mode
-    mout = nil,                -- dedicated MIDI out
+    mout = nil,                -- dedicated MIDI out (can be nil to use chord OUT)
   }
 
   -- --- Output routing (own device/voice) ---
@@ -675,21 +676,50 @@ local Arp = (function()
     local mval = params:get("arp_out_mode") or 1
     return (mval==2) or (mval==3)
   end
-  local function setup_midi_out(param_index)
-    local real_port = S.midi.ports_map[param_index] or 1
+
+  local function setup_midi_out(param_index_in_s_midi_devices)
+    -- param_index_in_s_midi_devices is 1..#S.midi.devices (no sentinel)
+    local real_port = S.midi.ports_map[param_index_in_s_midi_devices] or 1
     if A.mout then A.mout.event = nil; A.mout = nil end
     A.mout = midi.connect(real_port)
     if A.mout then print("ARP MIDI OUT: "..(midi.vports[real_port].name or ("port "..real_port))) end
   end
+
+  -- SMART FANOUT with fallback: if MIDI requested but unavailable, still monitor via mx
   local function fanout_on(note, vel)
     local canon = S.canonical_names[params:get("arp_mx_voice") or 1] or ""
-    if want_mx() then MX.on_free(canon, note, util.clamp(vel,1,127)) end
-    if want_midi() and A.mout then pcall(function() A.mout:note_on(util.clamp(note,0,127), util.clamp(vel,1,127), params:get("arp_midi_out_ch") or 1) end) end
+    -- send MIDI if requested and available
+    local sent_midi = false
+    if want_midi() then
+      local ch = params:get("arp_midi_out_ch") or 1
+      local dev = A.mout or S.midi.out  -- fallback to chord MIDI out when Arp device sentinel is selected
+      if not dev then print("ARP: want_midi() but no MIDI device (A.mout=nil and S.midi.out=nil)") end
+      print(string.format("ARP SEND on: note=%d vel=%d ch=%d midi=%s", note, vel, ch, dev and "yes" or "no"))
+      if dev then
+        pcall(function() dev:note_on(util.clamp(note,0,127), util.clamp(vel,1,127), ch) end)
+        sent_midi = true
+      end
+    end
+    -- smart fallback monitor to mx if (a) mx is enabled OR (b) MIDI-only was requested but nothing actually sent
+    if want_mx() or (want_midi() and not sent_midi) then
+      MX.on_free(canon, note, util.clamp(vel,1,127))
+    end
   end
   local function fanout_off(note)
     local canon = S.canonical_names[params:get("arp_mx_voice") or 1] or ""
-    if want_mx() then MX.off(canon, note) end
-    if want_midi() and A.mout then pcall(function() A.mout:note_off(util.clamp(note,0,127), 0, params:get("arp_midi_out_ch") or 1) end) end
+    local turned_off_midi = false
+    if want_midi() then
+      local ch = params:get("arp_midi_out_ch") or 1
+      local dev = A.mout or S.midi.out
+      print(string.format("ARP SEND off: note=%d ch=%d midi=%s", note, ch, dev and "yes" or "no"))
+      if dev then
+        pcall(function() dev:note_off(util.clamp(note,0,127), 0, ch) end)
+        turned_off_midi = true
+      end
+    end
+    if want_mx() or (want_midi() and not turned_off_midi) then
+      MX.off(canon, note)
+    end
   end
   local function all_off() for n,_ in pairs(A.emitted) do fanout_off(n) end; A.emitted = {} end
 
@@ -702,12 +732,14 @@ local Arp = (function()
   end
 
   local function make_material()
+    -- ENFORCEMENT: do not auto-generate arp material until a chord has been played
     local base_notes = {}
     if type(S.last_voiced_notes)=="table" and #S.last_voiced_notes>0 then
       for _,n in ipairs(S.last_voiced_notes) do base_notes[#base_notes+1]=n end
     else
-      local chord = select(1, chord_for_degree(S.root_midi, 1, S.chord_type, S.inversion, S.spread, S.sus_mode))
-      for _,n in ipairs(chord) do base_notes[#base_notes+1]=n end
+      -- No chord captured yet -> keep material empty so arp stays silent
+      A.notes_buf = {}
+      return
     end
     table.sort(base_notes)
 
@@ -790,6 +822,7 @@ local Arp = (function()
     A.running = true
     A.step_i  = 1
     make_material()
+    print("ARP: start")
     while A.running do
       local wait = step_seconds()
       step_once()
@@ -807,8 +840,10 @@ local Arp = (function()
     A.coro = clock.run(run)
   end
   local function stop()
+    if not A.running and not A.coro then return end
     A.running = false
     if A.coro then clock.cancel(A.coro); A.coro=nil end
+    print("ARP: stop")
     all_off()
   end
 
@@ -831,7 +866,14 @@ local Arp = (function()
   end
 
   local function hotplug_refresh()
-    setup_midi_out(params:get("arp_midi_out_dev") or 1)
+    local sel = params:get("arp_midi_out_dev") or 1
+    -- sel==1 is sentinel "(use Chord MIDI out)"
+    if sel == 1 then
+      A.mout = nil
+      print("ARP MIDI OUT: using Chord MIDI out (sentinel)")
+    else
+      setup_midi_out(sel - 1)
+    end
   end
 
   return {
@@ -1092,12 +1134,23 @@ end
 local function panic_all_outputs()
   if S.mx and S.mx.all_notes_off then pcall(function() S.mx:all_notes_off() end) end
   MIDI.off_all()
+
+  -- NEW: chord voice active-offs
+  do
+    local canon = S.canonical_names[S.voice_index] or ""
+    for _,notes in pairs(S.chord_active) do
+      for _,n in ipairs(notes) do fanout_note_off(canon, n) end
+    end
+    S.chord_active = {}
+  end
+
   -- free off
   local fcanon = S.canonical_names[S.free.voice_index] or ""
   S.free.hold_tokens = {}
   for _,q in pairs(S.free.active_map) do Free.fanout_off(fcanon, q) end
   for _,outs in pairs(S.free.chord_active) do for _,n in ipairs(outs) do Free.fanout_off(fcanon, n) end end
   S.free.active_map = {}; S.free.chord_active = {}
+
   -- arp off
   Arp.stop()
 end
@@ -1112,9 +1165,18 @@ local function make_strum_order(count)
 end
 
 local function handle_note_on(canon, root_note, vel, deg)
+  -- Defensive: if this root is already active, turn it off first to avoid overlaps
+  if S.chord_active[root_note] then
+    for _,n in ipairs(S.chord_active[root_note]) do fanout_note_off(canon, n) end
+    S.chord_active[root_note] = nil
+  end
+
   local chord, qual, name_root_midi = chord_for_degree(root_note, deg, S.chord_type, S.inversion, S.spread, S.sus_mode)
   S.last_voiced_notes = {}; for i,n in ipairs(chord) do S.last_voiced_notes[i] = n end
   S.last_bass_note = chord[1]
+
+  -- NEW: record emitted notes for this root key
+  S.chord_active[root_note] = { table.unpack(chord) }
 
   S.last_chord_name = build_chord_display_name(chord, qual, name_root_midi); S.last_name_time = now()
 
@@ -1172,11 +1234,13 @@ local function handle_note_off(canon, root_note)
   if (params:get("chorder_hold_strum") or 1) == 2 then
     S.chord_hold_tokens[root_note] = nil
   end
-  local pc = root_note % 12
-  local deg = K.WHITE_TO_DEG[pc]; if not deg then return end
-  local chord = chord_for_degree(root_note, deg, S.chord_type, S.inversion, S.spread, S.sus_mode)
-  local notes = (type(chord)=="table" and chord[1] and type(chord[1])=="number") and chord or {}
-  for _,n in ipairs(notes) do fanout_note_off(canon, n) end
+
+  -- NEW: turn off exactly what we turned on
+  local notes = S.chord_active[root_note]
+  if notes then
+    for _,n in ipairs(notes) do fanout_note_off(canon, n) end
+    S.chord_active[root_note] = nil
+  end
 end
 
 -- ===== Free handlers =====
@@ -1528,6 +1592,13 @@ local function rebind_midi_in_if_needed()
   end
 end
 
+-- Helper to build Arp device options with sentinel
+local function arp_device_options()
+  local t = {"(use Chord MIDI out)"} -- sentinel index 1
+  for i=1,#S.midi.devices do t[#t+1] = S.midi.devices[i] end
+  return t
+end
+
 local function rebuild_midi_lists()
   local remembered_in_long = nil
   do
@@ -1551,10 +1622,13 @@ local function rebuild_midi_lists()
   local p_free_out = params:lookup_param(S.free.midi_out_dev_param)
   if p_free_out then p_free_out.options = S.midi.devices; p_free_out.count = #S.midi.devices end
 
-  -- also refresh Arp device list combo
+  -- also refresh Arp device list combo (with sentinel)
   params:hide("arp_midi_out_dev"); params:show("arp_midi_out_dev")
   local p_arp_out = params:lookup_param("arp_midi_out_dev")
-  if p_arp_out then p_arp_out.options = S.midi.devices; p_arp_out.count = #S.midi.devices end
+  if p_arp_out then
+    p_arp_out.options = arp_device_options()
+    p_arp_out.count   = #p_arp_out.options
+  end
 
   if remembered_in_long then
     local idx = 1
@@ -1597,17 +1671,38 @@ local function add_arp_section()
     function() params:add_option("arp_gate", "gate", {"release","25%","50%","75%","100%"}, 3) end,
 
     div("Output"),
-    function() params:add_option("arp_out_mode", "output", {"mx.samples","mx.samples + MIDI","MIDI"}, 1) end,
+    function()
+      params:add_option("arp_out_mode", "output", {"mx.samples","mx.samples + MIDI","MIDI"}, 1)
+      -- When output mode changes, refresh arp routing so fallback logic is accurate right away
+      params:set_action("arp_out_mode", function(_) Arp.hotplug_refresh() end)
+    end,
     function()
       params:add_option("arp_mx_voice", "mx.samples", (#S.display_names>0 and S.display_names or {"(no packs)"}), 1)
       params:set_action("arp_mx_voice", function(i) MX.ensure_loaded(i) end)
     end,
     function()
-      params:add_option("arp_midi_out_dev", "MIDI out", S.midi.devices, 1)
-      params:set_action("arp_midi_out_dev", function(i) Arp.setup_midi_out(i) end)
+      params:add_option("arp_midi_out_dev", "MIDI out", (function()
+        local t = {"(use Chord MIDI out)"} -- sentinel at index 1
+        for i=1,#S.midi.devices do t[#t+1] = S.midi.devices[i] end
+        return t
+      end)(), 1)
+      params:set_action("arp_midi_out_dev", function(i)
+        if i == 1 then
+          -- sentinel: use Chord MIDI out
+          print("ARP MIDI OUT: using Chord MIDI out")
+          -- keep A.mout=nil; fanout uses fallback S.midi.out
+        else
+          Arp.setup_midi_out(i - 1) -- shift for sentinel
+        end
+      end)
     end,
     function() params:add_option("arp_midi_out_ch", "MIDI out ch", (function() local t={} for i=1,16 do t[i]=tostring(i) end; return t end)(), 1) end,
   })
+end
+
+local function update_arp_visibility()
+  show_param("arp_midi_out_dev", true)
+  show_param("arp_midi_out_ch",  true)
 end
 
 function init()
@@ -1972,12 +2067,13 @@ function init()
   -- === SECTION 5: CHORDER · Arpeggio ===
   add_arp_section()
 
-  -- hotplug
+  -- Hotplug
   midi.add = function(dev)
     print("MIDI added: "..(dev.name or "?"))
     rebuild_midi_lists()
     Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
-    Arp.setup_midi_out(params:get("arp_midi_out_dev") or 1)
+    -- Respect sentinel for Arp:
+    Arp.hotplug_refresh()
   end
   midi.remove = function(dev)
     print("MIDI removed: "..(dev.name or "?"))
@@ -1985,7 +2081,8 @@ function init()
     setup_midi_in(params:get(S.midi.in_dev_param) or default_midi_in_index)
     MIDI.setup_out(params:get(S.midi.out_dev_param) or 1)
     Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
-    Arp.setup_midi_out(params:get("arp_midi_out_dev") or 1)
+    -- Respect sentinel for Arp:
+    Arp.hotplug_refresh()
   end
 
   -- initial visibility
@@ -1996,6 +2093,8 @@ function init()
   show_param("free_vel_fixed", S.free.velocity_mode == 1)
   show_param("free_gate_mode", Free.want_midi())
   update_free_visibility()
+  update_arp_visibility()
+  params:set_action("arp_out_mode", function(_) update_arp_visibility(); Arp.hotplug_refresh() end)
 
   -- clock & devices
   recompute_root_midi()
@@ -2004,7 +2103,8 @@ function init()
   MX.ensure_loaded(S.voice_index)
   MIDI.setup_out(1)
   Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
-  Arp.setup_midi_out(params:get("arp_midi_out_dev") or 1)
+  -- Respect sentinel selection at boot:
+  Arp.hotplug_refresh()
   setup_midi_in(params:get(S.midi.in_dev_param) or default_midi_in_index)
   rebind_midi_in_if_needed()
   redraw()
