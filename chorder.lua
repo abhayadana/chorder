@@ -1,4 +1,4 @@
--- CHORDER — a three-voice chord+based instrument (single-file refactor A+B + Arp MIDI patches)
+-- CHORDER — a three-voice chord-based instrument
 -- Author: @abhayadana (refactor pass by ChatGPT)
 -- Engine: mx.samples and/or MIDI
 --
@@ -9,8 +9,8 @@ engine.name = "MxSamples"
 local musicutil = require "musicutil"
 local mxsamples = include "mx.samples/lib/mx.samples"
 local chordlib  = include "lib/chordlib"
-local Strum     = include "lib/strum"    -- moved Strum to its own module
-local Timing    = include "lib/timing"   -- NEW: factored timing helpers
+local Strum     = include "lib/strum"
+local Feel      = include "lib/feel" 
 
 -- ===== config =====
 local BASE = _path.audio .. "mx.samples"
@@ -443,7 +443,7 @@ local Arp = (function()
 
   local function step_seconds()
     local div = K.QUANT_DIV_MAP[K.QUANT_DIV_OPTS[params:get("arp_div") or 6] or "1/8"] or 1/8
-    return Timing.step_seconds(div, clock.get_tempo(), params:get("arp_swing_mode") or 1, params:get("arp_swing_pct") or 0, A.step_i)
+    return Feel.step_seconds(div, clock.get_tempo(), params:get("arp_swing_mode") or 1, params:get("arp_swing_pct") or 0, A.step_i)
   end
 
   local function step_once()
@@ -538,9 +538,6 @@ local function fanout_note_off(canon, note)
   if want_midi() then pcall(function() if S.midi.out then S.midi.out:note_off(note, 0, S.midi.channel) end end) end
 end
 
-local function jitter_steps(max_steps) if max_steps <= 0 then return 0 end; return math.random(0, max_steps) end
-local function jitter_velocity(vel, range) if range <= 0 then return vel end; local d = math.random(-range, range); return util.clamp(vel + d, 1, 127) end
-
 -- ===== Free module (key modes, timing, fanout) =====
 local Free = (function()
   local function free_want_mx()
@@ -597,9 +594,9 @@ local Free = (function()
     return chordlib.quantize_to_scale(sc, note)
   end
 
-  -- NEW: delegate offsets to Timing (1-based offsets for Free)
+  -- NEW: delegate offsets to Feel (1-based offsets for Free)
   local function free_compute_step_offsets(m)
-    return Timing.step_offsets_one_index(
+    return Feel.step_offsets_one_index(
       m,
       S.free.strum_steps or 0,
       S.free.timing_shape or 1,
@@ -760,8 +757,8 @@ local function handle_note_on(canon, root_note, vel, deg)
 
   local order = make_strum_order(#chord)
 
-  -- NEW: use Timing module (zero-index offsets to match original chord path)
-  local offs = Timing.step_offsets_zero_index(
+  -- NEW: use Feel module (zero-index offsets to match original chord path)
+  local offs = Feel.step_offsets_zero_index(
     #order,
     S.strum_steps or 0,
     params:get("chorder_timing_shape") or 1,
@@ -792,8 +789,8 @@ local function handle_note_on(canon, root_note, vel, deg)
     )
     local pos_in_sorted = idx_in_sorted[n] or 1
 
-    -- NEW: velocity via Timing module
-    local v = Timing.apply_velocity(
+    -- NEW: velocity via Feel module
+    local v = Feel.apply_velocity(
       k, #order, v_base, pos_in_sorted, n_sorted,
       params:get("chorder_ramp_per_step") or 0,
       params:get("chorder_accent") or 1,
@@ -1507,32 +1504,12 @@ function init()
       params:set_action("free_enable", function(i) S.free.enable = (i==2); if not S.free.enable then panic_all_outputs() end; redraw() end)
     end,
 
-    div("Instrument & Output"),
-    function()
-      params:add_option("free_mx_voice", "mx.samples", (#S.display_names>0 and S.display_names or {"(no packs)"}), 1)
-      params:set_action("free_mx_voice", function(i) S.free.voice_index = i; MX.ensure_loaded(i); redraw() end)
-    end,
-    function()
-      params:add_option(S.free.out_mode_param, "output", S.free.out_opts, 1)
-      params:set_action(S.free.out_mode_param, function(_) panic_all_outputs(); rebind_midi_in_if_needed(); show_param("free_gate_mode", Free.want_midi()); redraw() end)
-    end,
-
-    div("MIDI Out"),
-    function()
-      params:add_option(S.free.midi_out_dev_param, "MIDI out", S.midi.devices, 1)
-      params:set_action(S.free.midi_out_dev_param, function(i) Free.setup_midi_out(i); panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
-    end,
-    function()
-      params:add_option(S.free.midi_out_ch_param, "MIDI out ch", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
-      params:set_action(S.free.midi_out_ch_param, function(idx) S.free.midi_channel = idx; panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
-    end,
-
     div("MIDI In"),
     function() params:add_option(S.free.midi_in_ch_param, "MIDI input ch", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 2) end,
 
     div("Key Input Mode"),
     function()
-      params:add_option(S.free.key_mode_param, "free key mode",
+      params:add_option(S.free.key_mode_param, "",
         {"white keys (diatonic degrees)","all keys → quantized to scale","all keys chromatic (mono only)"}, S.free.key_mode)
       params:set_action(S.free.key_mode_param, function(i)
         S.free.key_mode = i
@@ -1545,15 +1522,35 @@ function init()
       end)
     end,
 
+    div("Instrument & Output"),
+    function()
+      params:add_option(S.free.out_mode_param, "output", S.free.out_opts, 1)
+      params:set_action(S.free.out_mode_param, function(_) panic_all_outputs(); rebind_midi_in_if_needed(); show_param("free_gate_mode", Free.want_midi()); redraw() end)
+    end,
+    function()
+      params:add_option("free_mx_voice", "mx.samples", (#S.display_names>0 and S.display_names or {"(no packs)"}), 1)
+      params:set_action("free_mx_voice", function(i) S.free.voice_index = i; MX.ensure_loaded(i); redraw() end)
+    end,
+
+    div("MIDI Out"),
+    function()
+      params:add_option(S.free.midi_out_dev_param, "MIDI out", S.midi.devices, 1)
+      params:set_action(S.free.midi_out_dev_param, function(i) Free.setup_midi_out(i); panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
+    end,
+    function()
+      params:add_option(S.free.midi_out_ch_param, "MIDI out ch", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
+      params:set_action(S.free.midi_out_ch_param, function(idx) S.free.midi_channel = idx; panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
+    end,
+
     div("Mode"),
     function()
       params:add_option("free_mode", "play mode", {"mono","chord"}, S.free.mode)
       params:set_action("free_mode", function(i) S.free.mode = i end)
     end,
 
-    div("Chord Recipe"),
+    div("Chord Build"),
     function()
-      params:add_option("free_seventh", "type", {"triad","7th"}, S.free.seventh)
+      params:add_option("free_seventh", "chord type", {"triad","7th"}, S.free.seventh)
       params:set_action("free_seventh", function(i) S.free.seventh = i end)
     end,
     function()
