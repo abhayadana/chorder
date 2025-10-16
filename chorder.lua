@@ -10,7 +10,7 @@ local musicutil = require "musicutil"
 local mxsamples = include "mx.samples/lib/mx.samples"
 local chordlib  = include "lib/chordlib"
 local Strum     = include "lib/strum"
-local Feel      = include "lib/feel" 
+local Feel      = include "lib/feel"
 
 -- ===== config =====
 local BASE = _path.audio .. "mx.samples"
@@ -75,8 +75,16 @@ local S = {
     strum_steps=0, strum_type=1, timing_shape=1, timing_amt=50, timing_skip_steps=1,
     velocity_mode=2, fixed_velocity=100, gate_mode=1, midi_channel=1,
     key_mode_param = "free_key_mode", key_mode=1,
-    mode=1, seventh=1, inversion=0, spread=0, voicing=1, add_bass=1,
-    transpose_oct=0,
+
+    -- chord build / voicing (Free)
+    chord_type = 1,      -- 1=triad, 2=7th, 3=9th
+    sus_mode   = 1,      -- 1=normal, 2=sus2, 3=sus4
+    inversion  = 0,
+    spread     = 0,
+    voicing    = 1,
+    add_bass   = 1,
+
+    mode=1, transpose_oct=0,
     midi_out_dev_param = "free_midi_out_dev", midi_out_ch_param = "free_midi_out_ch",
     midi_in_ch_param  = "free_midi_in_ch",
     mout=nil,
@@ -254,7 +262,7 @@ local MIDI = (function()
 
   private_midi_build_in  = build_midi_in_device_list_awake
 
-  local function setup_midi_out_awake(param_index)
+  private_midi_setup_out = function(param_index)
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
     if S.midi.out then S.midi.out.event = nil; S.midi.out = nil end
     S.midi.out = midi.connect(real_port)
@@ -262,9 +270,7 @@ local MIDI = (function()
     else print("MIDI OUT: connect failed for port "..real_port) end
   end
 
-  private_midi_setup_out = setup_midi_out_awake
-
-  local function midi_out_on_awake(note, vel127)
+  private_midi_on = function(note, vel127)
     if not S.midi.out then return end
     local vel = util.clamp(vel127, 1, 127)
     local n   = util.clamp(note,   0, 127)
@@ -272,8 +278,6 @@ local MIDI = (function()
     if not ok then print("MIDI OUT note_on error: "..tostring(err)) end
     active_on(n)
   end
-
-  private_midi_on        = midi_out_on_awake
 
   local function all_midi_notes_off()
     if not S.midi.out then active_clear(); return end
@@ -446,6 +450,7 @@ local Arp = (function()
     return Feel.step_seconds(div, clock.get_tempo(), params:get("arp_swing_mode") or 1, params:get("arp_swing_pct") or 0, A.step_i)
   end
 
+  private_step_once = nil
   local function step_once()
     all_off()
     if not A.running then return end
@@ -463,6 +468,7 @@ local Arp = (function()
     end
     A.step_i = A.step_i + 1
   end
+  private_step_once = step_once
 
   local function run()
     A.running = true
@@ -866,23 +872,25 @@ local function free_handle_note_on(in_note, in_vel)
     return
   end
 
+  -- snapshot Chord voice voicing flags while we reuse chordlib
   local save_voicing, save_add = S.voicing, S.add_bass
   S.voicing, S.add_bass = S.free.voicing, (S.free.add_bass == 2)
-  local free_chord_type = (S.free.seventh == 2) and 2 or 1
 
   local notes, qual, name_root_midi = chordlib.build_chord{
-    scale = sc,
-    base_midi = base,
-    degree = deg,
-    chord_type = free_chord_type,
-    inversion = S.free.inversion,
-    spread = S.free.spread,
-    sus_mode = 1,
-    voicing_mode = S.free.voicing,
-    add_bass = (S.free.add_bass == 2),
-    last_voiced_notes = nil,
-    last_bass_note = nil
+    scale            = sc,
+    base_midi        = base,
+    degree           = deg,
+    chord_type       = S.free.chord_type,        -- 1=triad, 2=7th, 3=9th
+    inversion        = S.free.inversion,
+    spread           = S.free.spread,
+    sus_mode         = S.free.sus_mode,          -- 1=normal, 2=sus2, 3=sus4
+    voicing_mode     = S.free.voicing,
+    add_bass         = (S.free.add_bass == 2),
+    last_voiced_notes= nil,
+    last_bass_note   = nil
   }
+
+  -- restore chord path flags
   S.voicing, S.add_bass = save_voicing, save_add
 
   table.sort(notes)
@@ -909,12 +917,12 @@ local function free_handle_note_on(in_note, in_vel)
   S.free.chord_active[in_note] = emitted
 
   local symbol = chordlib.symbol_for(notes, qual, name_root_midi, {
-    chord_type = free_chord_type,
-    sus_mode = 1,
-    inversion = S.free.inversion,
+    chord_type   = S.free.chord_type,
+    sus_mode     = S.free.sus_mode,
+    inversion    = S.free.inversion,
     voicing_mode = S.free.voicing,
-    add_bass = (S.free.add_bass == 2),
-    spread = S.free.spread
+    add_bass     = (S.free.add_bass == 2),
+    spread       = S.free.spread
   })
   S.free.last_name = symbol
   S.free.last_time = util.time()
@@ -1076,17 +1084,18 @@ local function div(label) return function() _sep_counter = _sep_counter + 1; par
 
 local function update_free_visibility()
   local chroma = (S.free.key_mode == 3)
-  show_param("free_mode", not chroma)
-  show_param("free_seventh", not chroma)
-  show_param("free_inversion", not chroma)
-  show_param("free_spread", not chroma)
-  show_param("free_voicing", not chroma)
-  show_param("free_add_bass", not chroma)
-  show_param("free_strum_steps", not chroma)
-  show_param("free_strum_type", not chroma)
-  show_param("free_timing_shape", not chroma)
-  show_param("free_timing_amt", not chroma)
-  show_param("free_timing_skip_steps", not chroma)
+  show_param("free_mode",                not chroma)
+  show_param("free_chord_type",          not chroma)
+  show_param("free_sus_mode",            not chroma)
+  show_param("free_inversion",           not chroma)
+  show_param("free_spread",              not chroma)
+  show_param("free_voicing",             not chroma)
+  show_param("free_add_bass",            not chroma)
+  show_param("free_strum_steps",         not chroma)
+  show_param("free_strum_type",          not chroma)
+  show_param("free_timing_shape",        not chroma)
+  show_param("free_timing_amt",          not chroma)
+  show_param("free_timing_skip_steps",   not chroma)
 end
 
 -- ===== MIDI In setup (demux) =====
@@ -1549,10 +1558,17 @@ function init()
     end,
 
     div("Chord Build"),
+    -- New: chord type (triad/7th/9th) aligned with Chord voice
     function()
-      params:add_option("free_seventh", "chord type", {"triad","7th"}, S.free.seventh)
-      params:set_action("free_seventh", function(i) S.free.seventh = i end)
+      params:add_option("free_chord_type", "chord type", {"triad","7th","9th"}, S.free.chord_type)
+      params:set_action("free_chord_type", function(i) S.free.chord_type = i end)
     end,
+    -- New: third handling for Free Play
+    function()
+      params:add_option("free_sus_mode", "third handling", {"normal","sus2","sus4"}, S.free.sus_mode)
+      params:set_action("free_sus_mode", function(i) S.free.sus_mode = i end)
+    end,
+    -- Existing controls retained
     function()
       params:add_number("free_inversion", "inversion (0-3)", 0, 3, S.free.inversion)
       params:set_action("free_inversion", function(v) S.free.inversion = util.clamp(v,0,3) end)
@@ -1569,6 +1585,15 @@ function init()
     function()
       params:add_option("free_add_bass", "add bass (root -12)", {"off","on"}, S.free.add_bass)
       params:set_action("free_add_bass", function(i) S.free.add_bass = i end)
+    end,
+
+    -- Deprecated pset shim: if an old pset contains "free_seventh", map it to free_chord_type and hide it.
+    function()
+      params:add_option("free_seventh", "(deprecated) chord type (triad/7th)", {"triad","7th"}, 1)
+      params:set_action("free_seventh", function(i)
+        if i == 1 then params:set("free_chord_type", 1) elseif i == 2 then params:set("free_chord_type", 2) end
+      end)
+      params:hide("free_seventh")
     end,
 
     div("Strum (Free)"),
@@ -1599,7 +1624,7 @@ function init()
 
     div("Velocity & Gate (Free)"),
     function()
-      params:add_option("free_vel_mode", "velocity src", {"fixed","incoming"}, S.free.velocity_mode)
+      params:add_option("free_vel_mode", "velocity src (free)", {"fixed","incoming"}, S.free.velocity_mode)
       params:set_action("free_vel_mode", function(i) S.free.velocity_mode = i; show_param("free_vel_fixed", i==1) end)
     end,
     function()
