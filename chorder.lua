@@ -29,11 +29,11 @@ local S = {
   chord_type = 1, sus_mode = 1, inversion = 0, spread = 0,
   voicing = 1, add_bass = false,
 
-  -- velocity / humanize
+  -- velocity / humanize (Chord)
   velocity_mode = 1, fixed_velocity = 100,
   humanize_steps_max = 0, humanize_vel_range = 0,
 
-  -- timing / grid
+  -- timing / grid (global clock for the event queue)
   quantize = false, strum_steps = 0, strum_type = 1,
   tick_div = 1/4, tick_div_str = "1/4", swing_mode = 1, swing_percent = 0, swing_phase = 0,
 
@@ -51,7 +51,8 @@ local S = {
 
   -- output mode & levels
   out_mode_param = "chorder_out_mode",
-  mx_vol_pct = 100,
+  mx_vol_pct = 100,          -- Chord path MX volume
+  arp_mx_vol_pct = 100,      -- Arp path MX volume
 
   -- MIDI (Chord path)
   midi = {
@@ -72,22 +73,31 @@ local S = {
     enable=false, voice_index=1,
     out_mode_param = "free_out_mode",
     out_opts = {"mx.samples","mx.samples + MIDI","MIDI"},
+    -- timing / strum
     strum_steps=0, strum_type=1, timing_shape=1, timing_amt=50, timing_skip_steps=1,
+    swing_mode=1, swing_pct=0,            -- local swing for Free (strum skew)
+    quantize=false,                       -- local quantize toggle (uses global division)
+    -- velocity & gate
     velocity_mode=2, fixed_velocity=100, gate_mode=1, midi_channel=1,
+    -- keying
     key_mode_param = "free_key_mode", key_mode=1,
-
     -- chord build / voicing (Free)
     chord_type = 1,      -- 1=triad, 2=7th, 3=9th
     sus_mode   = 1,      -- 1=normal, 2=sus2, 3=sus4
-    inversion  = 0,
-    spread     = 0,
-    voicing    = 1,
-    add_bass   = 1,
-
+    inversion  = 0, spread = 0, voicing = 1, add_bass = 1,
+    -- dynamics (Free)
+    ramp_per_step = 0, accent = 1, accent_amt = 0,   -- ramp & accent parity with chord
+    -- humanize (Free) — steps use the same grid units as strum offsets
+    hum_steps_max = 0, hum_vel_range = 0,
+    -- flam (Free)
+    flam = 1, flam_count = 1, flam_space = 1, flam_vel = -8,
+    -- mode, transpose
     mode=1, transpose_oct=0,
+    -- MIDI ports
     midi_out_dev_param = "free_midi_out_dev", midi_out_ch_param = "free_midi_out_ch",
     midi_in_ch_param  = "free_midi_in_ch",
     mout=nil,
+    -- live state
     active_map={}, chord_active={}, hold_tokens={},
     last_name=nil, last_time=0,
     mx_vol_pct = 100,
@@ -204,13 +214,13 @@ local MX = (function()
     if not ok then print("mx:on error: "..tostring(err).." (name='"..canon_name.."')") end
   end
 
-  -- Arp-safe MX monitor that uses the chord mx volume
+  -- Arp-safe MX monitor uses dedicated arp volume
   local function mx_on_safe_arp(canon_name, midi_note, vel127)
     canon_name = canon_name or ""; if canon_name=="" then return end
     local ok, err = pcall(function()
       S.mx:on({
         name = canon_name, midi = midi_note, velocity = util.clamp(vel127,1,127),
-        amp = S.mx_vol_pct / 100, gain = S.mx_vol_pct / 100
+        amp = S.arp_mx_vol_pct / 100, gain = S.arp_mx_vol_pct / 100
       })
     end)
     if not ok then print("mx:on (arp) error: "..tostring(err).." (name='"..canon_name.."')") end
@@ -249,7 +259,7 @@ local MIDI = (function()
 
   private_midi_build_out = build_midi_device_list_awake
 
-  local function build_midi_in_device_list_awake()
+  private_midi_build_in  = function()
     S.midi.in_devices = {"none"}
     S.midi.in_ports_map = { [1] = 0 }
     for i = 1, #midi.vports do
@@ -259,8 +269,6 @@ local MIDI = (function()
       S.midi.in_ports_map[#S.midi.in_devices] = i
     end
   end
-
-  private_midi_build_in  = build_midi_in_device_list_awake
 
   private_midi_setup_out = function(param_index)
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
@@ -307,7 +315,7 @@ local MIDI = (function()
   end
 
   return {
-    build_out = private_midi_build_out,
+    build_out = build_midi_device_list_awake,
     build_in  = private_midi_build_in,
     setup_out = private_midi_setup_out,
     on        = private_midi_on,
@@ -422,7 +430,7 @@ local Arp = (function()
     local stype = params:get("arp_order") or 1
     return select(1, Strum.make(#A.notes_buf, stype, A.ord_state)) or {}
   end
-  private_next_note = nil
+
   local function next_note(step_idx)
     local ord = build_order(); if #ord==0 then return nil end
     local idx = ord[((step_idx-1) % #ord) + 1]
@@ -441,34 +449,45 @@ local Arp = (function()
         o = t % (span+1) -- wrap
       end
     end
-    return util.clamp(base + o*12, 0, 127)
+    local tr = (params:get("arp_transpose_oct") or 0) * 12
+    return util.clamp(base + o*12 + tr, 0, 127)
   end
-  private_next_note = next_note
 
   local function step_seconds()
     local div = K.QUANT_DIV_MAP[K.QUANT_DIV_OPTS[params:get("arp_div") or 6] or "1/8"] or 1/8
     return Feel.step_seconds(div, clock.get_tempo(), params:get("arp_swing_mode") or 1, params:get("arp_swing_pct") or 0, A.step_i)
   end
 
-  private_step_once = nil
   local function step_once()
     all_off()
     if not A.running then return end
-    local vel = util.clamp((params:get("arp_vel") or 100) + (A.step_i-1)*(params:get("arp_vel_ramp") or 0), 1, 127)
+
+    local vel_base = util.clamp((params:get("arp_vel") or 100) + (A.step_i-1)*(params:get("arp_vel_ramp") or 0), 1, 127)
     local n = next_note(A.step_i)
     if n then
-      fanout_on(n, vel)
-      A.emitted[n]=true
       local gm = params:get("arp_gate") or 1
-      if gm > 1 then
-        local frac = (gm==2 and 0.25) or (gm==3 and 0.50) or (gm==4 and 0.75) or 1.0
-        local dur = step_seconds()*frac
-        clock.run(function() clock.sleep(dur); if A.emitted[n] then fanout_off(n); A.emitted[n]=nil end end)
+      local frac = (gm==2 and 0.25) or (gm==3 and 0.50) or (gm==4 and 0.75) or 1.0
+      local hsteps = params:get("arp_hum_steps") or 0
+      local hvel   = params:get("arp_hum_vel") or 0
+      local pre = 0
+      if hsteps > 0 then
+        local sub = math.random(0, hsteps)
+        pre = (sub / 8) * step_seconds()
       end
+      local vel2 = util.clamp(vel_base + math.random(-hvel, hvel), 1, 127)
+
+      clock.run(function()
+        if pre > 0 then clock.sleep(pre) end
+        fanout_on(n, vel2)
+        A.emitted[n]=true
+        if gm > 1 then
+          local dur = step_seconds()*frac
+          clock.run(function() clock.sleep(dur); if A.emitted[n] then fanout_off(n); A.emitted[n]=nil end end)
+        end
+      end)
     end
     A.step_i = A.step_i + 1
   end
-  private_step_once = step_once
 
   local function run()
     A.running = true
@@ -600,15 +619,29 @@ local Free = (function()
     return chordlib.quantize_to_scale(sc, note)
   end
 
-  -- NEW: delegate offsets to Feel (1-based offsets for Free)
+  -- One-index offsets for Free; then apply local swing skew (integer step skew).
   local function free_compute_step_offsets(m)
-    return Feel.step_offsets_one_index(
+    local offs = Feel.step_offsets_one_index(
       m,
       S.free.strum_steps or 0,
       S.free.timing_shape or 1,
       S.free.timing_amt or 50,
       S.free.timing_skip_steps or 1
     )
+    if (S.free.swing_mode or 1) == 2 and (S.free.swing_pct or 0) > 0 then
+      local s = util.clamp(S.free.swing_pct, 0, 75) / 100
+      local skew_steps = math.floor((S.free.strum_steps or 0) * s + 0.5)
+      if skew_steps > 0 then
+        for i=1,#offs do
+          if (i % 2 == 1) then
+            offs[i] = (offs[i] or 0) + skew_steps
+          else
+            offs[i] = math.max(0, (offs[i] or 0) - skew_steps)
+          end
+        end
+      end
+    end
+    return offs
   end
 
   local function free_make_strum_order(count)
@@ -666,7 +699,7 @@ end)()
 -- ===== Event queue / clock =====
 local function queue_in_steps(steps, fn) table.insert(S.evq, {steps=math.max(0, steps), fn=fn}) end
 local function schedule(step_steps, fn) if not S.quantize and step_steps == 0 then fn() else queue_in_steps(step_steps, fn) end end
-local function free_schedule(step_steps, fn) if step_steps == 0 then fn() else queue_in_steps(step_steps, fn) end end
+local function free_schedule(step_steps, fn) if not S.free.quantize and step_steps == 0 then fn() else queue_in_steps(step_steps, fn) end end
 
 local function clock_loop()
   while true do
@@ -763,7 +796,6 @@ local function handle_note_on(canon, root_note, vel, deg)
 
   local order = make_strum_order(#chord)
 
-  -- NEW: use Feel module (zero-index offsets to match original chord path)
   local offs = Feel.step_offsets_zero_index(
     #order,
     S.strum_steps or 0,
@@ -795,7 +827,6 @@ local function handle_note_on(canon, root_note, vel, deg)
     )
     local pos_in_sorted = idx_in_sorted[n] or 1
 
-    -- NEW: velocity via Feel module
     local v = Feel.apply_velocity(
       k, #order, v_base, pos_in_sorted, n_sorted,
       params:get("chorder_ramp_per_step") or 0,
@@ -837,13 +868,15 @@ end
 
 -- ===== Free handlers =====
 local function free_handle_note_on(in_note, in_vel)
-  local play_vel = (S.free.velocity_mode == 1) and S.free.fixed_velocity or util.clamp(in_vel or 100, 1, 127)
+  local incoming = util.clamp(in_vel or 100, 1, 127)
+  local base_play_vel = (S.free.velocity_mode == 1) and S.free.fixed_velocity or incoming
   local fcanon = S.canonical_names[S.free.voice_index] or ""
 
   if S.free.key_mode == 3 then
     local base = util.clamp(in_note + 12 * (S.free.transpose_oct or 0), 0, 127)
+    local v = util.clamp(base_play_vel + math.random(-(S.free.hum_vel_range or 0),(S.free.hum_vel_range or 0)), 1, 127)
     S.free.active_map[in_note] = base
-    Free.fanout_on(fcanon, base, play_vel)
+    Free.fanout_on(fcanon, base, v)
     Free.gate_for(base)
     return
   end
@@ -866,13 +899,13 @@ local function free_handle_note_on(in_note, in_vel)
   base = util.clamp(base + 12 * (S.free.transpose_oct or 0), 0, 127)
 
   if S.free.mode == 1 then
+    local v = util.clamp(base_play_vel + math.random(-(S.free.hum_vel_range or 0),(S.free.hum_vel_range or 0)), 1, 127)
     S.free.active_map[in_note] = base
-    Free.fanout_on(fcanon, base, play_vel)
+    Free.fanout_on(fcanon, base, v)
     Free.gate_for(base)
     return
   end
 
-  -- snapshot Chord voice voicing flags while we reuse chordlib
   local save_voicing, save_add = S.voicing, S.add_bass
   S.voicing, S.add_bass = S.free.voicing, (S.free.add_bass == 2)
 
@@ -889,14 +922,16 @@ local function free_handle_note_on(in_note, in_vel)
     last_voiced_notes= nil,
     last_bass_note   = nil
   }
-
-  -- restore chord path flags
   S.voicing, S.add_bass = save_voicing, save_add
 
   table.sort(notes)
   local ord = (#notes > 1 and S.free.strum_steps > 0) and Free.make_order(#notes)
               or (function(n) local t = {}; for i = 1, n do t[i] = i end; return t end)(#notes)
   local offs = Free.step_offs(#ord)
+
+  local sorted = (function(t) local c={}; for i,n in ipairs(t) do c[i]=n end; table.sort(c); return c end)(notes)
+  local idx_in_sorted = {}; for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
+  local n_sorted = #sorted
 
   local hold_on = (params:get("free_hold_strum") or 1) == 2
   local tid = next_trigger_id()
@@ -905,13 +940,43 @@ local function free_handle_note_on(in_note, in_vel)
   local emitted = {}
   for k, idx in ipairs(ord) do
     local n = notes[idx]
-    local s = offs[k] or 0
+    local s = (offs[k] or 0) + math.random(0, S.free.hum_steps_max or 0)
+
+    local v_base = util.clamp(
+      base_play_vel + math.random(-(S.free.hum_vel_range or 0), (S.free.hum_vel_range or 0)),
+      1, 127
+    )
+    local pos_in_sorted = idx_in_sorted[n] or 1
+    local v = Feel.apply_velocity(
+      k, #ord, v_base, pos_in_sorted, n_sorted,
+      params:get("free_ramp_per_step") or 0,
+      params:get("free_accent") or 1,
+      params:get("free_accent_amt") or 0
+    )
+
     free_schedule(s, function()
       if (not hold_on) or (S.free.hold_tokens[in_note] == tid) then
-        Free.fanout_on(fcanon, n, play_vel)
+        Free.fanout_on(fcanon, n, v)
         Free.gate_for(n)
       end
     end)
+
+    if (params:get("free_flam") or S.free.flam) == 2 then
+      local flam_cnt   = params:get("free_flam_count") or S.free.flam_count or 0
+      local flam_space = params:get("free_flam_space") or S.free.flam_space or 1
+      local flam_dvel  = params:get("free_flam_vel") or S.free.flam_vel or -8
+      for j=1, flam_cnt do
+        local ds = j * flam_space
+        local vv = util.clamp(v + j * flam_dvel, 1, 127)
+        free_schedule(s + ds, function()
+          if (not hold_on) or (S.free.hold_tokens[in_note] == tid) then
+            Free.fanout_on(fcanon, n, vv)
+            Free.gate_for(n)
+          end
+        end)
+      end
+    end
+
     emitted[#emitted + 1] = n
   end
   S.free.chord_active[in_note] = emitted
@@ -1096,6 +1161,18 @@ local function update_free_visibility()
   show_param("free_timing_shape",        not chroma)
   show_param("free_timing_amt",          not chroma)
   show_param("free_timing_skip_steps",   not chroma)
+  show_param("free_hum_steps",           not chroma)
+  show_param("free_hum_vel",             not chroma)
+  show_param("free_ramp_per_step",       not chroma)
+  show_param("free_accent",              not chroma)
+  show_param("free_accent_amt",          not chroma)
+  show_param("free_flam",                not chroma)
+  show_param("free_flam_count",          not chroma)
+  show_param("free_flam_space",          not chroma)
+  show_param("free_flam_vel",            not chroma)
+  show_param("free_swing_mode",          not chroma)
+  show_param("free_swing_pct",           not chroma)
+  show_param("free_quantize",            not chroma)
 end
 
 -- ===== MIDI In setup (demux) =====
@@ -1238,10 +1315,17 @@ local function add_arp_section()
     function() params:add_number("arp_octaves", "octave span", 0, 3, 1) end,
     function() params:add_option("arp_oct_walk", "octave walk", {"wrap","bounce"}, 1) end,
 
+    div("Transpose"),
+    function() params:add_number("arp_transpose_oct", "transpose (oct)", -4, 4, 0) end,
+
     div("Timing"),
     function() params:add_option("arp_div", "division", K.QUANT_DIV_OPTS, 6) end, -- 1/8
     function() params:add_option("arp_swing_mode", "swing mode", {"grid","swing %"}, 1) end,
     function() params:add_number("arp_swing_pct", "swing %", 0, 75, 0) end,
+
+    div("Humanize"),
+    function() params:add_number("arp_hum_steps", "humanize timing (max steps)", 0, 4, 0) end,
+    function() params:add_number("arp_hum_vel", "humanize velocity (+/-)", 0, 30, 0) end,
 
     div("Velocity & Gate"),
     function() params:add_number("arp_vel", "base velocity", 1, 127, 100) end,
@@ -1272,6 +1356,12 @@ local function add_arp_section()
       end)
     end,
     function() params:add_option("arp_midi_out_ch", "MIDI out ch", (function() local t={} for i=1,16 do t[i]=tostring(i) end; return t end)(), 1) end,
+
+    div("Levels"),
+    function()
+      params:add_number("arp_mx_vol_pct", "arpeggio mx volume (%)", 0, 200, S.arp_mx_vol_pct)
+      params:set_action("arp_mx_vol_pct", function(v) S.arp_mx_vol_pct = util.clamp(math.floor(v or 100), 0, 200) end)
+    end,
   })
 end
 
@@ -1547,7 +1637,7 @@ function init()
       params:set_action(S.free.midi_out_dev_param, function(i) Free.setup_midi_out(i); panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
     end,
     function()
-      params:add_option(S.free.midi_out_ch_param, "MIDI out ch", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 1)
+      params:add_option(S.free.midi_out_ch_param, "MIDI out ch", (function() local t={} for i=1,16 do t[i]=tostring(i) end; return t end)(), 1)
       params:set_action(S.free.midi_out_ch_param, function(idx) S.free.midi_channel = idx; panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
     end,
 
@@ -1558,17 +1648,14 @@ function init()
     end,
 
     div("Chord Build"),
-    -- New: chord type (triad/7th/9th) aligned with Chord voice
     function()
       params:add_option("free_chord_type", "chord type", {"triad","7th","9th"}, S.free.chord_type)
       params:set_action("free_chord_type", function(i) S.free.chord_type = i end)
     end,
-    -- New: third handling for Free Play
     function()
       params:add_option("free_sus_mode", "third handling", {"normal","sus2","sus4"}, S.free.sus_mode)
       params:set_action("free_sus_mode", function(i) S.free.sus_mode = i end)
     end,
-    -- Existing controls retained
     function()
       params:add_number("free_inversion", "inversion (0-3)", 0, 3, S.free.inversion)
       params:set_action("free_inversion", function(v) S.free.inversion = util.clamp(v,0,3) end)
@@ -1587,7 +1674,6 @@ function init()
       params:set_action("free_add_bass", function(i) S.free.add_bass = i end)
     end,
 
-    -- Deprecated pset shim: if an old pset contains "free_seventh", map it to free_chord_type and hide it.
     function()
       params:add_option("free_seventh", "(deprecated) chord type (triad/7th)", {"triad","7th"}, 1)
       params:set_action("free_seventh", function(i)
@@ -1621,6 +1707,38 @@ function init()
       params:add_number("free_timing_skip_steps", "skip size (steps)", 0, 8, S.free.timing_skip_steps)
       params:set_action("free_timing_skip_steps", function(v) S.free.timing_skip_steps = util.clamp(v,0,8) end)
     end,
+
+    div("Swing & Quantize (Free)"),
+    function() params:add_option("free_swing_mode", "swing mode", {"grid","swing %"}, S.free.swing_mode) end,
+    function()
+      params:add_number("free_swing_pct", "swing %", 0, 75, S.free.swing_pct)
+      params:set_action("free_swing_pct", function(v) S.free.swing_pct = util.clamp(v,0,75) end)
+    end,
+    function()
+      params:add_option("free_quantize", "quantize free hits", {"off","on"}, (S.free.quantize and 2 or 1))
+      params:set_action("free_quantize", function(i) S.free.quantize = (i==2) end)
+    end,
+
+    div("Humanize (Free)"),
+    function()
+      params:add_number("free_hum_steps", "humanize timing (max steps)", 0, 4, S.free.hum_steps_max)
+      params:set_action("free_hum_steps", function(v) S.free.hum_steps_max = util.clamp(v,0,4) end)
+    end,
+    function()
+      params:add_number("free_hum_vel", "humanize velocity (+/-)", 0, 30, S.free.hum_vel_range)
+      params:set_action("free_hum_vel", function(v) S.free.hum_vel_range = util.clamp(v,0,30) end)
+    end,
+
+    div("Dynamics (Free)"),
+    function() params:add_number("free_ramp_per_step", "velocity ramp / step", -24, 24, S.free.ramp_per_step) end,
+    function() params:add_option("free_accent", "accent target", {"none","bass","top","middle"}, S.free.accent) end,
+    function() params:add_number("free_accent_amt", "accent amount", -30, 30, S.free.accent_amt) end,
+
+    div("Flam (Free)"),
+    function() params:add_option("free_flam", "flam", {"off","on"}, S.free.flam) end,
+    function() params:add_number("free_flam_count", "flam hits (extra)", 0, 3, S.free.flam_count) end,
+    function() params:add_number("free_flam_space", "flam spacing (steps)", 1, 4, S.free.flam_space) end,
+    function() params:add_number("free_flam_vel", "flam vel delta", -30, 0, S.free.flam_vel) end,
 
     div("Velocity & Gate (Free)"),
     function()
