@@ -114,8 +114,8 @@ local K = {
     "edge-kiss","ping-pair","arp chunk 2–3","guitar rake","harp gliss split",
     "arp chunk 2–3 ↓","guitar rake ↓","harp gliss split (interleaved)"
   },
-  -- added slow divisions 2/1, 3/1, 4/1
-  QUANT_DIV_OPTS = {"1/1","2/1","3/1","4/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"},
+  -- reordered in decreasing order
+  QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"},
   QUANT_DIV_MAP  = {
     ["4/1"]=4/1, ["3/1"]=3/1, ["2/1"]=2/1, ["1/1"]=1/1, ["1/2"]=1/2, ["1/3"]=1/3, ["1/4"]=1/4,
     ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32
@@ -640,6 +640,7 @@ local Arp = (function()
     return util.clamp(base + o*12 + tr, 0, 127)
   end
 
+  private = {}
   local function step_once_legacy()
     all_off()
     if not A.running then return end
@@ -968,10 +969,16 @@ local function handle_note_on(canon, root_note, vel, deg)
   Arp.chord_key(true)
 
   local order = make_strum_order(#chord)
-  local offs = Feel.step_offsets_zero_index(
-    #order, S.strum_steps or 0, params:get("chorder_timing_shape") or 1, params:get("chorder_timing_amt") or 50,
+
+  -- FIX: use 1-based offsets (to match Lua and Free Play)
+  local offs = Feel.step_offsets_one_index(
+    #order,
+    S.strum_steps or 0,
+    params:get("chorder_timing_shape") or 1,
+    params:get("chorder_timing_amt") or 50,
     params:get("chorder_timing_skip_steps") or 1
   )
+
   local sorted = (function(t) local c={}; for i,n in ipairs(t) do c[i]=n end; table.sort(c); return c end)(chord)
   local idx_in_sorted = {}; for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
   local n_sorted = #sorted
@@ -987,7 +994,7 @@ local function handle_note_on(canon, root_note, vel, deg)
 
   for k,idx in ipairs(order) do
     local n = chord[idx]
-    local s = (offs[k-1] or 0) + math.random(0, S.humanize_steps_max or 0)
+    local s = (offs[k] or 0) + math.random(0, S.humanize_steps_max or 0)
     local v_base = util.clamp((vel or 100) + math.random(-(S.humanize_vel_range or 0),(S.humanize_vel_range or 0)), 1, 127)
     local pos_in_sorted = idx_in_sorted[n] or 1
     local v = Feel.apply_velocity(
@@ -1441,7 +1448,8 @@ local function update_free_visibility()
   show_param("free_voicing",             not chroma)
   show_param("free_add_bass",            not chroma)
   show_param("free_strum_steps",         not chroma)
-  show_param("free_strum_type",          not chromma)
+  -- FIX: typo chromma -> chroma
+  show_param("free_strum_type",          not chroma)
   show_param("free_timing_shape",        not chroma)
   show_param("free_timing_amt",          not chroma)
   show_param("free_timing_skip_steps",   not chroma)
@@ -1613,7 +1621,7 @@ local function add_timing_section()
       params:set_action("chorder_quantize", function(i) S.quantize = (i==2); redraw() end)
     end,
     function()
-      params:add_option("chorder_quant_div", "quantize division", K.QUANT_DIV_OPTS, 4)
+      params:add_option("chorder_quant_div", "quantize division", K.QUANT_DIV_OPTS, 4) -- index 4 is 1/1 in reordered list
       params:set_action("chorder_quant_div", function(i) S.tick_div_str = K.QUANT_DIV_OPTS[i]; S.tick_div = K.QUANT_DIV_MAP[S.tick_div_str] or 1/4; redraw() end)
     end,
     function()
@@ -1821,7 +1829,7 @@ local function add_arp_section()
     end,
 
     div("ARP · Timing"),
-    function() params:add_option("arp_div", "division", K.QUANT_DIV_OPTS, 9) end, -- default 1/8
+    function() params:add_option("arp_div", "division", K.QUANT_DIV_OPTS, 9) end, -- default 1/8 (index 9 with reordered list)
     function() params:add_option("arp_swing_mode", "swing mode", {"grid","swing %"}, 1) end,
     function() params:add_number("arp_swing_pct", "swing %", 0, 75, 0) end,
 
