@@ -41,6 +41,17 @@ local S = {
   last_voiced_notes = nil, last_bass_note = nil,
   chord_active = {},
 
+  -- momentary chord modifiers (armed by holding black keys)
+  mod = {
+    seventh = false,   -- C# holds = 7th
+    ninth   = false,   -- D# holds = 9th (mutually exclusive with seventh)
+    sus2    = false,   -- F# holds = sus2
+    sus4    = false,   -- G# holds = sus4 (mutually exclusive with sus2)
+    add_bass= false,   -- A# holds = +bass (force on)
+    active  = false,   -- true if any is armed
+    hint    = "",      -- HUD/Chord-page hint text
+  },
+
   -- display / hud
   last_chord_name = nil, last_name_time = 0, last_name_timeout = 2.0,
 
@@ -189,6 +200,49 @@ local function safe_add_option(id, label, opts, default_index)
   for _ in pairs(opts) do count = count + 1 end
   local def = math.max(1, math.min(tonumber(default_index or 1) or 1, count))
   params:add_option(id, label, opts, def)
+end
+
+-- ===== momentary mod helpers =====
+local function mod_rebuild_hint()
+  local parts = {}
+  if S.mod.seventh then parts[#parts+1] = "7" end
+  if S.mod.ninth   then parts[#parts+1] = "9" end
+  if S.mod.sus2    then parts[#parts+1] = "sus2" end
+  if S.mod.sus4    then parts[#parts+1] = "sus4" end
+  if S.mod.add_bass then parts[#parts+1] = "+bass" end
+  S.mod.hint = (#parts>0) and table.concat(parts, " ") or ""
+  S.mod.active = (#parts>0)
+end
+
+local function mod_arm(kind, on)
+  if kind == "7th" then
+    S.mod.seventh = on
+    if on then S.mod.ninth = false end
+  elseif kind == "9th" then
+    S.mod.ninth = on
+    if on then S.mod.seventh = false end
+  elseif kind == "sus2" then
+    S.mod.sus2 = on
+    if on then S.mod.sus4 = false end
+  elseif kind == "sus4" then
+    S.mod.sus4 = on
+    if on then S.mod.sus2 = false end
+  elseif kind == "bass" then
+    S.mod.add_bass = on
+  end
+  mod_rebuild_hint()
+  redraw()
+end
+
+-- Compute effective build parameters for the chord path (momentary overrides)
+local function mod_effective_build()
+  -- chord_type: 1=triad, 2=7th, 3=9th
+  local eff_chord_type = (S.mod.ninth and 3) or (S.mod.seventh and 2) or S.chord_type
+  -- sus_mode: 1=normal, 2=sus2, 3=sus4
+  local eff_sus_mode   = (S.mod.sus2 and 2) or (S.mod.sus4 and 3) or S.sus_mode
+  -- add_bass: boolean
+  local eff_add_bass   = S.mod.add_bass or S.add_bass
+  return eff_chord_type, eff_sus_mode, eff_add_bass
 end
 
 -- ===== MX module =====
@@ -390,7 +444,7 @@ local PatternLib = (function()
   local function clone(tbl) local t={}; for k,v in pairs(tbl) do t[k]=v end; return t end
   local function up1235(name) return { name=name, steps={deg(1),deg(2),deg(3),deg(5)} } end
   local function updown135(name) return { name=name, steps={deg(1),deg(3),deg(5),deg(3)} } end
-  local function bounce15(name) return { name=name, steps={deg(1),deg(5,0),deg(1),deg(5,1)} } end
+  local function bounce15(name) return { name=name, steps={deg(1,0),deg(5,0),deg(1,1),deg(5,0)} } end
   local function walk1357(name) return { name=name, steps={deg(1),deg(3),deg(5),deg(7)} } end
   local function add_oct(template, shift)
     local t = clone(template); t.steps = {}
@@ -763,8 +817,7 @@ local Arp = (function()
   end
 
   local function start()
-    if A.running then return end
-    if (params:get("arp_enable") or 1) ~= 2 then return end
+    A.running = true
     if A.coro then clock.cancel(A.coro) end
     A.coro = clock.run(run)
   end
@@ -780,7 +833,7 @@ local Arp = (function()
       A.has_chord = true
       if A.pat_enable then select_pattern() end
       A.step_i = 1
-      start()
+      -- arpeggio clocks independently; run() handles timing
     else
       local mode = params:get("arp_trigger_mode") or 1 -- 1=key-held, 2=latch
       if mode==1 then stop() end
@@ -986,22 +1039,24 @@ end
 
 local function build_chord_and_symbol(root_note, deg)
   local sc = scale128()
+  -- apply momentary overrides while computing
+  local eff_ct, eff_sus, eff_bass = mod_effective_build()
   local notes, qual, name_root_midi = chordlib.build_chord{
     scale = sc,
     base_midi = root_note,
     degree = deg,
-    chord_type = S.chord_type,
+    chord_type = eff_ct,
     inversion = S.inversion,
     spread = S.spread,
-    sus_mode = S.sus_mode,
+    sus_mode = eff_sus,
     voicing_mode = S.voicing,
-    add_bass = S.add_bass,
+    add_bass = eff_bass,
     last_voiced_notes = S.last_voiced_notes,
     last_bass_note = S.last_bass_note
   }
   local symbol = chordlib.symbol_for(notes, qual, name_root_midi, {
-    chord_type = S.chord_type, sus_mode = S.sus_mode, inversion = S.inversion,
-    voicing_mode = S.voicing, add_bass = S.add_bass, spread = S.spread
+    chord_type = eff_ct, sus_mode = eff_sus, inversion = S.inversion,
+    voicing_mode = S.voicing, add_bass = eff_bass, spread = S.spread
   })
   return notes, symbol, qual, name_root_midi
 end
@@ -1292,24 +1347,18 @@ local function draw_chord_page()
   draw_line(28, "Key:", key_center_string())
   draw_line(40, "Scale:", S.scale_name)
 
-  local parts = {}
-  for _,q in pairs(S.free.active_map) do parts[#parts+1]=q end
-  table.sort(parts)
-  local fp = nil
-  if #parts>0 then
-    local names = {}
-    for _,n in ipairs(parts) do local nm, oc = midi_to_name_oct(n); names[#names+1] = string.format("%s%d", nm, oc) end
-    fp = table.concat(names, " ")
+  -- show armed modifier hint on chord page too
+  if S.mod.active and S.mod.hint ~= "" then
+    screen.level(9); screen.move(64, 50); screen.text_center("mods: "..S.mod.hint)
   end
-  screen.level(fp and 12 or 10); screen.move(64, 50); screen.text_center("Free: " .. (fp or "—"))
 
   local now_t = now()
   local show_name = S.last_chord_name and ((now_t - S.last_name_time) < S.last_name_timeout)
   screen.level(15)
   if show_name then
-    screen.move(64, 60); screen.text_center(ellipsize(S.last_chord_name, 26))
+    screen.move(64, 58); screen.text_center(ellipsize(S.last_chord_name, 26))
   else
-    screen.level(10); screen.move(64, 60); screen.text_center("(play a chord)")
+    screen.level(10); screen.move(64, 58); screen.text_center("(play a chord)")
   end
 end
 
@@ -1321,24 +1370,29 @@ local function draw_hud_page()
   screen.text_center("Arp: "..(arp_on and trig or "off"))
   screen.level(9); screen.move(64, 14); screen.text_center("(free: "..free_key_mode_label()..")")
 
+  -- armed modifiers hint
+  if S.mod.active and S.mod.hint ~= "" then
+    screen.level(9); screen.move(64, 20); screen.text_center("mods: "..S.mod.hint)
+  end
+
   local now_t = now()
   local show_chord = S.last_chord_name and ((now_t - S.last_name_time) < S.last_name_timeout)
   local show_free  = S.free.last_name and ((now_t - S.free.last_time) < S.last_name_timeout)
 
   if show_chord then
     screen.level(15); pcall(function() screen.font_size(12) end)
-    screen.move(64, 28); screen.text_center(ellipsize(S.last_chord_name, 26))
+    screen.move(64, 34); screen.text_center(ellipsize(S.last_chord_name, 26))
     pcall(function() screen.font_size(8) end)
   else
-    screen.level(10); screen.move(64, 28); screen.text_center("(play a chord)")
+    screen.level(10); screen.move(64, 34); screen.text_center("(play a chord)")
   end
 
   if show_free then
     screen.level(12); pcall(function() screen.font_size(10) end)
-    screen.move(64, 44); screen.text_center(ellipsize(S.free.last_name, 26))
+    screen.move(64, 50); screen.text_center(ellipsize(S.free.last_name, 26))
     pcall(function() screen.font_size(8) end)
   else
-    screen.level(10); screen.move(64, 44); screen.text_center("(free chord)")
+    screen.level(10); screen.move(64, 50); screen.text_center("(free chord)")
   end
 
   local t = {}
@@ -1350,7 +1404,7 @@ local function draw_hud_page()
     for _,n in ipairs(t) do local nm, oc = midi_to_name_oct(n); parts[#parts+1] = string.format("%s%d", nm, oc) end
     fp = table.concat(parts, " ")
   end
-  screen.level(fp and 12 or 10); screen.move(64, 58)
+  screen.level(fp and 12 or 10); screen.move(64, 64)
   screen.text_center("Free: " .. (fp or "—"))
   screen.update()
 end
@@ -1434,11 +1488,25 @@ local function setup_midi_in(param_index)
 
     if msg.type == "note_on" and msg.vel > 0 then
       if chord_ok then
-        MX.ensure_loaded(S.voice_index)
         local pc = msg.note % 12
-        if K.WHITE_SET[pc] then
-          local deg = K.WHITE_TO_DEG[pc]
-          if deg then handle_note_on(canon, msg.note, chord_vel, deg) end
+
+        if not K.WHITE_SET[pc] then
+          -- BLACK KEYS (momentary arm while held):
+          -- C#(1):7th, D#(3):9th, F#(6):sus2, G#(8):sus4, A#(10):+bass
+          if pc == 1 then       mod_arm("7th", true)
+          elseif pc == 3 then   mod_arm("9th", true)
+          elseif pc == 6 then   mod_arm("sus2", true)
+          elseif pc == 8 then   mod_arm("sus4", true)
+          elseif pc == 10 then  mod_arm("bass", true)
+          end
+          return
+        end
+
+        -- WHITE KEYS (diatonic degrees) → Chord path
+        local deg = K.WHITE_TO_DEG[pc]
+        if deg then
+          MX.ensure_loaded(S.voice_index)
+          handle_note_on(canon, msg.note, chord_vel, deg)
         end
       end
 
@@ -1452,7 +1520,17 @@ local function setup_midi_in(param_index)
     elseif (msg.type == "note_off") or (msg.type == "note_on" and msg.vel == 0) then
       if chord_ok then
         local pc = msg.note % 12
-        if K.WHITE_SET[pc] then handle_note_off(canon, msg.note) end
+        if K.WHITE_SET[pc] then
+          handle_note_off(canon, msg.note)
+        else
+          -- BLACK KEY release = disarm
+          if pc == 1 then       mod_arm("7th", false)
+          elseif pc == 3 then   mod_arm("9th", false)
+          elseif pc == 6 then   mod_arm("sus2", false)
+          elseif pc == 8 then   mod_arm("sus4", false)
+          elseif pc == 10 then  mod_arm("bass", false)
+          end
+        end
       end
       if S.free.enable and free_ok then free_handle_note_off(msg.note) end
       redraw()
