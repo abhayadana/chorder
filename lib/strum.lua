@@ -1,179 +1,344 @@
 -- lib/strum.lua
--- Strum pattern generator for CHORDER
--- Returns orderings for a given count and strum type.
--- API: Strum.make(count, stype, state) -> order_tbl, updated_state
+-- Flat strum type list (no families), compatible with chorder.lua
+-- Exposes:
+--   Strum.TYPES                 -> ordered names
+--   Strum.index_by_name(name)   -> index
+--   Strum.make(n, idxOrName, state) -> orderTbl, state
 
-local M = {}
+local Strum = {}
 
-local function reverse_inplace(t)
-  local i, j = 1, #t
-  while i < j do
-    t[i], t[j] = t[j], t[i]
-    i = i + 1
-    j = j - 1
+-- ===== utilities =====
+local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi else return v end end
+local function reverse_inplace(t) local i, j = 1, #t; while i < j do t[i], t[j] = t[j], t[i]; i = i + 1; j = j - 1 end end
+local function shuffle_inplace(t) for i = #t, 2, -1 do local j = math.random(i); t[i], t[j] = t[j], t[i] end end
+local function range_up(n) local t = {}; for i=1,n do t[i]=i end; return t end
+local function range_down(n) local t = {}; local k=1; for i=n,1,-1 do t[k]=i; k=k+1 end; return t end
+
+-- ===== base patterns (keep original behavior) =====
+local function seq_up(n) return range_up(n) end
+local function seq_down(n) return range_down(n) end
+
+local function seq_up_down(n)
+  if n <= 1 then return {1} end
+  local t = {}; for i=1,n do t[#t+1] = i end
+  for i=n-1,2,-1 do t[#t+1] = i end
+  return t
+end
+
+local function seq_down_up(n)
+  if n <= 1 then return {1} end
+  local t = {}; for i=n,1,-1 do t[#t+1] = i end
+  for i=2,n-1 do t[#t+1] = i end
+  return t
+end
+
+local function seq_random(n) local t = range_up(n); shuffle_inplace(t); return t end
+
+local function seq_center_out(n)
+  if n == 1 then return {1} end
+  local c = math.floor((n+1)/2)
+  local out, L, R = {c}, c-1, c+1
+  while (#out < n) do
+    if R <= n then out[#out+1] = R; R = R + 1 end
+    if #out >= n then break end
+    if L >= 1 then out[#out+1] = L; L = L - 1 end
   end
+  return out
 end
 
-local function shuffle_inplace(t)
-  for i = #t, 2, -1 do
-    local j = math.random(1, i)
-    t[i], t[j] = t[j], t[i]
+local function seq_outside_in(n)
+  if n <= 2 then return range_up(n) end
+  local out, L, R = {}, 1, n
+  while L <= R do
+    out[#out+1] = L
+    if L < R then out[#out+1] = R end
+    L = L + 1; R = R - 1
   end
+  return out
 end
 
-local function center_out(n)
-  local seq = {}
-  local lo = math.floor((n + 1) / 2)
-  local hi = lo + 1
-  if n % 2 == 1 then
-    table.insert(seq, lo)
-    while (#seq < n) do
-      if hi <= n then table.insert(seq, hi) end
-      local left = lo - ((#seq % 2 == 0) and 0 or 1)
-      if left >= 1 and #seq < n then table.insert(seq, left) end
-      hi = hi + 1
-    end
-  else
-    local a, b = n / 2, n / 2 + 1
-    table.insert(seq, a)
-    table.insert(seq, b)
-    local step = 1
-    while #seq < n do
-      local l = a - step
-      local r = b + step
-      if l >= 1 then table.insert(seq, l) end
-      if r <= n and #seq < n then table.insert(seq, r) end
-      step = step + 1
-    end
-  end
-  return seq
+local function seq_bass_bounce(n)
+  if n <= 1 then return {1} end
+  local t = {1}
+  for i=2,n do t[#t+1] = i end
+  t[#t+1] = 1
+  return t
 end
 
-local function outside_in(n)
-  local seq = {}
-  local i, j = 1, n
-  while i <= j do
-    table.insert(seq, i)
-    if i ~= j then table.insert(seq, j) end
-    i = i + 1
-    j = j - 1
-  end
-  return seq
+local function seq_treble_bounce(n)
+  if n <= 1 then return {1} end
+  local t = {n}
+  for i=n-1,1,-1 do t[#t+1] = i end
+  t[#t+1] = n
+  return t
 end
 
-local function edge_kiss(n)
-  return outside_in(n)
+local function seq_random_no_repeat_first(n)
+  if n <= 1 then return {1} end
+  local rest = {}
+  for i=2,n do rest[#rest+1]=i end
+  shuffle_inplace(rest)
+  local t = {1}
+  for _,i in ipairs(rest) do t[#t+1]=i end
+  return t
 end
 
-local function ping_pair(n)
-  local seq = {}
+local function seq_random_stable_ends(n)
+  if n <= 2 then return range_up(n) end
+  local mid = {}
+  for i=2,n-1 do mid[#mid+1] = i end
+  shuffle_inplace(mid)
+  local t = {1}
+  for _,i in ipairs(mid) do t[#t+1] = i end
+  t[#t+1] = n
+  return t
+end
+
+local function seq_edge_kiss(n)
+  if n <= 2 then return range_up(n) end
+  local t = {}
   local L, R = 1, n
-  while L < R do
-    table.insert(seq, L)
-    if L + 1 <= R then table.insert(seq, L + 1) end
-    if R - 1 >= L + 2 then table.insert(seq, R - 1) end
-    table.insert(seq, R)
-    L = L + 2
-    R = R - 2
+  while L <= R do
+    t[#t+1] = L
+    if L < R then t[#t+1] = R end
+    L = L + 1; R = R - 1
   end
-  if L == R then table.insert(seq, L) end
-  return seq
+  return t
 end
 
-local function arp_chunk_2_3(n, up)
-  local base = {}
-  if up then for i = 1, n do base[#base + 1] = i end
-  else for i = n, 1, -1 do base[#base + 1] = i end end
-  local seq, i, toggle = {}, 1, true
-  while i <= #base do
-    local sz = toggle and 2 or 3
-    for k = i, math.min(i + sz - 1, #base) do seq[#seq + 1] = base[k] end
-    i = i + sz
-    toggle = not toggle
+local function seq_ping_pair(n)
+  if n <= 1 then return {1} end
+  local t, i = {}, 1
+  while i < n do
+    t[#t+1] = i
+    t[#t+1] = i+1
+    i = i + 2
   end
-  return seq
+  if n % 2 == 1 then t[#t+1] = n end
+  return t
 end
 
-local function guitar_rake(n, up)
-  local seq = {}
-  if up then for i = 1, n do seq[#seq + 1] = i end
-  else for i = n, 1, -1 do seq[#seq + 1] = i end end
-  return seq
-end
-
-local function harp_gliss_split(n)
-  local mid = math.floor(n / 2)
-  local lo = {}; for i = 1, mid do lo[#lo + 1] = i end
-  local hi = {}; for i = mid + 1, n do hi[#hi + 1] = i end
-  local seq = {}
-  for i = 1, #lo do seq[#seq + 1] = lo[i] end
-  for i = 1, #hi do seq[#seq + 1] = hi[i] end
-  return seq
-end
-
-local function harp_gliss_split_interleaved(n)
-  local mid = math.floor(n / 2)
-  local lo, hi = {}, {}
-  for i = 1, mid do lo[#lo + 1] = i end
-  for i = mid + 1, n do hi[#hi + 1] = i end
-  local seq, i = {}, 1
-  while i <= math.max(#lo, #hi) do
-    if i <= #lo then seq[#seq + 1] = lo[i] end
-    if i <= #hi then seq[#seq + 1] = hi[i] end
-    i = i + 1
+local function seq_arp_chunk_23(n)
+  if n <= 1 then return {1} end
+  local t, i = {}, 1
+  while i <= n do
+    t[#t+1] = i
+    if i+1 <= n then t[#t+1] = i+1 end
+    if i+2 <= n then t[#t+1] = i+2 end
+    i = i + 2
   end
-  return seq
+  return t
 end
 
--- Dispatcher
--- stype mapping:
--- 1 up, 2 down, 3 up/down, 4 down/up, 5 random, 6 center-out, 7 outside-in,
--- 8 bass-bounce, 9 treble-bounce, 10 random no-repeat first, 11 random stable ends,
--- 12 edge-kiss, 13 ping-pair, 14 arp chunk 2–3, 15 guitar rake, 16 harp gliss split,
--- 17 arp chunk 2–3 ↓, 18 guitar rake ↓, 19 harp gliss split (interleaved)
-function M.make(count, stype, state)
-  state = state or { alt_flip = false, last_first = nil, last_last = nil }
-  local order = {}
-  for i = 1, math.max(count or 0, 0) do order[i] = i end
-  local n = #order
-  if n <= 1 then return order, state end
+local function seq_guitar_rake(n) return range_up(n) end
+local function seq_harp_gliss_split(n)
+  local t, half = {}, math.floor(n/2)
+  for i=1,half do t[#t+1]=i end
+  for i=half+1,n do t[#t+1]=i end
+  return t
+end
+local function seq_arp_chunk_23_down(n) local t = seq_arp_chunk_23(n); reverse_inplace(t); return t end
+local function seq_guitar_rake_down(n) local t = seq_guitar_rake(n); reverse_inplace(t); return t end
 
-  if     stype == 1  then return order, state
-  elseif stype == 2  then reverse_inplace(order); return order, state
-  elseif stype == 3  then if state.alt_flip then reverse_inplace(order) end; state.alt_flip = not state.alt_flip; return order, state
-  elseif stype == 4  then if not state.alt_flip then reverse_inplace(order) end; state.alt_flip = not state.alt_flip; return order, state
-  elseif stype == 5  then shuffle_inplace(order); state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-  elseif stype == 6  then local seq = center_out(n); for k = 1, n do order[k] = seq[k] end; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-  elseif stype == 7  then local seq = outside_in(n); for k = 1, n do order[k] = seq[k] end; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-  elseif stype == 8  then local seq = outside_in(n); for k = 1, n do order[k] = seq[k] end; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-  elseif stype == 9  then local seq = outside_in(n); reverse_inplace(seq); for k = 1, n do order[k] = seq[k] end; state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-  elseif stype == 10 then
-    local tries = 0
-    repeat shuffle_inplace(order); tries = tries + 1 until (order[1] ~= state.last_first) or tries > 8
-    state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-  elseif stype == 11 then
-    if state.last_first and state.last_last and n >= 3 then
-      local middle = {}
-      for i = 1, n do if i ~= state.last_first and i ~= state.last_last then middle[#middle + 1] = i end end
-      shuffle_inplace(middle)
-      local out = { state.last_first }
-      for i = 1, #middle do out[#out + 1] = middle[i] end
-      out[#out + 1] = state.last_last
-      return out, state
+local function seq_harp_gliss_split_interleaved(n)
+  if n <= 2 then return range_up(n) end
+  local half = math.floor(n/2)
+  local t, i, j = {}, 1, half+1
+  while i <= half or j <= n do
+    if i <= half then t[#t+1] = i; i = i + 1 end
+    if j <= n   then t[#t+1] = j; j = j + 1 end
+  end
+  return t
+end
+
+-- ===== Additional patterns 20..29 =====
+local function seq_bass_random(n)
+  if n <= 1 then return {1} end
+  local rest = {}
+  for i=2,n do rest[#rest+1] = i end
+  shuffle_inplace(rest)
+  table.insert(rest, 1, 1)
+  return rest
+end
+
+local function seq_top_random(n)
+  if n <= 1 then return {1} end
+  local rest = {}
+  for i=1,n-1 do rest[#rest+1] = i end
+  shuffle_inplace(rest)
+  table.insert(rest, 1, n)
+  return rest
+end
+
+local function seq_outer_random_mid(n)
+  if n == 1 then return {1} end
+  if n == 2 then return {1,2} end
+  local mid = {}
+  for i=2,n-1 do mid[#mid+1] = i end
+  shuffle_inplace(mid)
+  local out = {1, n}
+  for _,i in ipairs(mid) do out[#out+1] = i end
+  return out
+end
+
+local function seq_weave_lo_hi(n)
+  local out, i, j = {}, 1, n
+  while i <= j do
+    out[#out+1] = i
+    if i < j then out[#out+1] = j end
+    i = i + 1; j = j - 1
+  end
+  return out
+end
+
+local function seq_weave_hi_lo(n)
+  local out, i, j = {}, 1, n
+  while i <= j do
+    out[#out+1] = j
+    if i < j then out[#out+1] = i end
+    i = i + 1; j = j - 1
+  end
+  return out
+end
+
+local function seq_inside_out_alt(n)
+  local c = math.floor((n+1)/2)
+  local L, R = c-1, c+1
+  local out, take_right = {c}, true
+  while #out < n do
+    if take_right and R <= n then out[#out+1] = R; R = R + 1
+    elseif (not take_right) and L >= 1 then out[#out+1] = L; L = L - 1
+    elseif R <= n then out[#out+1] = R; R = R + 1
+    elseif L >= 1 then out[#out+1] = L; L = L - 1 end
+    take_right = not take_right
+  end
+  return out
+end
+
+local function seq_inside_out_rand(n)
+  local c = math.floor((n+1)/2)
+  local L, R = c-1, c+1
+  local out = {c}
+  while #out < n do
+    if L < 1 then out[#out+1] = R; R = R + 1
+    elseif R > n then out[#out+1] = L; L = L - 1
+    else
+      if math.random() < 0.5 then out[#out+1] = L; L = L - 1
+      else out[#out+1] = R; R = R + 1 end
     end
-    shuffle_inplace(order)
-    state.last_first = order[1]; state.last_last  = order[#order]; return order, state
-  elseif stype == 12 then return edge_kiss(n), state
-  elseif stype == 13 then return ping_pair(n), state
-  elseif stype == 14 then return arp_chunk_2_3(n, true), state
-  elseif stype == 15 then return guitar_rake(n, true), state
-  elseif stype == 16 then return harp_gliss_split(n), state
-  elseif stype == 17 then return arp_chunk_2_3(n, false), state
-  elseif stype == 18 then return guitar_rake(n, false), state
-  elseif stype == 19 then return harp_gliss_split_interleaved(n), state
   end
-
-  return order, state
+  return out
 end
 
-return M
+local function seq_odds_then_evens_up(n)
+  local out = {}
+  for i=1,n,2 do out[#out+1] = i end
+  for i=2,n,2 do out[#out+1] = i end
+  return out
+end
+
+local function seq_evens_then_odds_up(n)
+  local out = {}
+  for i=2,n,2 do out[#out+1] = i end
+  for i=1,n,2 do out[#out+1] = i end
+  return out
+end
+
+local function seq_lowhalf_up_highhalf_down(n)
+  local mid = math.floor(n/2)
+  local out = {}
+  for i=1, mid do out[#out+1] = i end
+  for i=n, mid+1, -1 do out[#out+1] = i end
+  return out
+end
+
+-- ===== Public type list (flat, ordered) =====
+Strum.TYPES = {
+  -- Classic
+  "up", "down", "up/down", "down/up", "random",
+  -- Contour
+  "center-out", "outside-in", "bass-bounce", "treble-bounce",
+  -- Variants / extras
+  "random (no repeat first)",         -- 10
+  "random (stable ends)",             -- 11
+  "edge-kiss",                        -- 12
+  "ping-pair",                        -- 13
+  "arp-chunk 2-3",                    -- 14
+  "guitar-rake",                      -- 15
+  "harp-gliss split",                 -- 16
+  "arp-chunk 2-3 (down)",             -- 17
+  "guitar-rake (down)",               -- 18
+  "harp-gliss interleaved",           -- 19
+  "bass-random",                      -- 20
+  "top-random",                       -- 21
+  "outer random → mid",               -- 22
+  "weave lo→hi",                      -- 23
+  "weave hi→lo",                      -- 24
+  "inside-out (alt)",                 -- 25
+  "inside-out (random)",              -- 26
+  "odds then evens",                  -- 27
+  "evens then odds",                  -- 28
+  "low-half up / high-half down",     -- 29
+}
+
+-- Map names -> indices (case-insensitive)
+local NAME_TO_INDEX = (function()
+  local m = {}
+  for i, name in ipairs(Strum.TYPES) do m[string.lower(name)] = i end
+  return m
+end)()
+
+-- For chorder.lua compatibility
+function Strum.index_by_name(name)
+  if type(name) ~= "string" then return 1 end
+  return NAME_TO_INDEX[string.lower(name)] or 1
+end
+
+-- Factory: accepts number OR name
+function Strum.make(n, idx_or_name, state)
+  n = clamp(n or 0, 0, 64)
+  if n <= 0 then return {}, (state or { alt_flip=false, last_first=nil, last_last=nil }) end
+  state = state or { alt_flip=false, last_first=nil, last_last=nil }
+
+  local stype = idx_or_name
+  if type(idx_or_name) == "string" then
+    stype = Strum.index_by_name(idx_or_name)
+  elseif type(idx_or_name) ~= "number" then
+    stype = 1
+  end
+  stype = clamp(math.floor(stype), 1, #Strum.TYPES)
+
+  if     stype == 1  then return seq_up(n), state
+  elseif stype == 2  then return seq_down(n), state
+  elseif stype == 3  then return seq_up_down(n), state
+  elseif stype == 4  then return seq_down_up(n), state
+  elseif stype == 5  then return seq_random(n), state
+  elseif stype == 6  then return seq_center_out(n), state
+  elseif stype == 7  then return seq_outside_in(n), state
+  elseif stype == 8  then return seq_bass_bounce(n), state
+  elseif stype == 9  then return seq_treble_bounce(n), state
+  elseif stype == 10 then return seq_random_no_repeat_first(n), state
+  elseif stype == 11 then return seq_random_stable_ends(n), state
+  elseif stype == 12 then return seq_edge_kiss(n), state
+  elseif stype == 13 then return seq_ping_pair(n), state
+  elseif stype == 14 then return seq_arp_chunk_23(n), state
+  elseif stype == 15 then return seq_guitar_rake(n), state
+  elseif stype == 16 then return seq_harp_gliss_split(n), state
+  elseif stype == 17 then return seq_arp_chunk_23_down(n), state
+  elseif stype == 18 then return seq_guitar_rake_down(n), state
+  elseif stype == 19 then return seq_harp_gliss_split_interleaved(n), state
+  elseif stype == 20 then return seq_bass_random(n), state
+  elseif stype == 21 then return seq_top_random(n), state
+  elseif stype == 22 then return seq_outer_random_mid(n), state
+  elseif stype == 23 then return seq_weave_lo_hi(n), state
+  elseif stype == 24 then return seq_weave_hi_lo(n), state
+  elseif stype == 25 then return seq_inside_out_alt(n), state
+  elseif stype == 26 then return seq_inside_out_rand(n), state
+  elseif stype == 27 then return seq_odds_then_evens_up(n), state
+  elseif stype == 28 then return seq_evens_then_odds_up(n), state
+  elseif stype == 29 then return seq_lowhalf_up_highhalf_down(n), state
+  end
+  return seq_up(n), state
+end
+
+return Strum

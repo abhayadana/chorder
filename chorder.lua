@@ -68,6 +68,8 @@ local S = {
   -- Instruments (mx.samples)
   display_names = {}, canonical_names = {}, folder_names = {}, voice_index = 1, loaded_set = {},
 
+  arp_order_idx = 1,
+
   -- Free Play
   free = {
     enable=false, voice_index=1,
@@ -99,6 +101,8 @@ local S = {
     active_map={}, chord_active={}, hold_tokens={},
     last_name=nil, last_time=0,
     mx_vol_pct = 100,
+    -- new: memory mirror for param
+    hold_to_strum = false,
   },
 }
 
@@ -108,11 +112,35 @@ local function next_trigger_id() S.trigger_seq = S.trigger_seq + 1; return S.tri
 local K = {
   NOTE_NAMES_SHARP = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"},
   STRUM_OPTS = {
-    "up","down","up/down","down/up","random",
-    "center-out","outside-in","bass-bounce","treble-bounce",
-    "random no-repeat first","random stable ends",
-    "edge-kiss","ping-pair","arp chunk 2–3","guitar rake","harp gliss split",
-    "arp chunk 2–3 ↓","guitar rake ↓","harp gliss split (interleaved)"
+    "up",
+    "down",
+    "up/down",
+    "down/up",
+    "random",
+    "center-out",
+    "outside-in",
+    "bass-bounce",
+    "treble-bounce",
+    "random no-repeat first",
+    "random stable ends",
+    "edge-kiss",
+    "ping-pair",
+    "arp chunk 2–3",
+    "guitar rake",
+    "harp gliss split",
+    "arp chunk 2–3 ↓",
+    "guitar rake ↓",
+    "harp gliss split (interleaved)",
+    "bass→random",
+    "top→random",
+    "outer→random-mid",
+    "weave low↔high",
+    "weave high↔low",
+    "inside-out (alt)",
+    "inside-out (random)",
+    "odds↑ then evens↑",
+    "evens↑ then odds↑",
+    "low-half↑ then high-half↓",
   },
   -- reordered in decreasing order
   QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"},
@@ -124,16 +152,44 @@ local K = {
   WHITE_TO_DEG   = { [0]=1, [2]=2, [4]=3, [5]=4, [7]=5, [9]=6, [11]=7 },
 }
 
+-- === Quantize division safety ===
+local function ensure_quant_div_tables()
+  if not K.QUANT_DIV_OPTS or not K.QUANT_DIV_MAP then
+    K.QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"}
+    K.QUANT_DIV_MAP  = {
+      ["4/1"]=4/1, ["3/1"]=3/1, ["2/1"]=2/1, ["1/1"]=1/1, ["1/2"]=1/2, ["1/3"]=1/3, ["1/4"]=1/4,
+      ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32
+    }
+  end
+end
+
 -- ===== small utils =====
 local function trim(s) return (s and s:gsub("^%s*(.-)%s*$", "%1")) or "" end
 local function lower(s) return string.lower(s or "") end
 local function now() return util.time() end
+local function param_is_on(opt_id)
+  local p = params:lookup_param(opt_id)
+  if not p then return false end
+  local v = params:get(opt_id) or 1
+  return v == 2
+end
 math.randomseed(os.time())
 
 local function recompute_root_midi() S.root_midi = (S.root_oct + 1) * 12 + S.root_pc end
 local function midi_to_name_oct(m) local pc=m%12; local oct=math.floor(m/12)-1; return K.NOTE_NAMES_SHARP[pc+1],oct end
 local function ellipsize(s, n) s=tostring(s or ""); if #s<=n then return s end; return s:sub(1, math.max(0,n-1)).."…" end
 local function short_mode_name(mode) if mode=="mx.samples" then return "mx" elseif mode=="mx.samples + MIDI" then return "mx+M" elseif mode=="MIDI" then return "MIDI" else return mode or "?" end end
+
+-- Safe wrapper: never pass nil/empty options into params:add_option
+local function safe_add_option(id, label, opts, default_index)
+  if type(opts) ~= "table" or next(opts) == nil then
+    opts = {"(none)"} -- keep params system happy
+  end
+  local count = 0
+  for _ in pairs(opts) do count = count + 1 end
+  local def = math.max(1, math.min(tonumber(default_index or 1) or 1, count))
+  params:add_option(id, label, opts, def)
+end
 
 -- ===== MX module =====
 local MX = (function()
@@ -266,7 +322,6 @@ local MIDI = (function()
     end
   end
 
-  private = {}
   local function setup_out(param_index)
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
     if S.midi.out then S.midi.out.event = nil; S.midi.out = nil end
@@ -290,6 +345,7 @@ local MIDI = (function()
     active_clear()
   end
 
+  private = {}
   local function compute_gate_seconds()
     local sel = params:get(S.midi.gate_param) or 1
     if sel == 1 then return nil end
@@ -525,7 +581,7 @@ local Arp = (function()
   end
 
   local function build_order()
-    local stype = params:get("arp_order") or 1
+    local stype = S.arp_order_idx or 1
     return select(1, Strum.make(#A.notes_buf, stype, A.ord_state)) or {}
   end
 
@@ -576,7 +632,6 @@ local Arp = (function()
     local st = steps[idx] or {}
     local wait = step_seconds()
 
-    -- combined step probability (pattern step prob * global arp_step_prob)
     local gprob = (params:get("arp_step_prob") or 100) / 100
     local prob = (st.prob or 1.0) * gprob
     local is_rest = st.rest or (math.random() > prob)
@@ -596,7 +651,6 @@ local Arp = (function()
         end
         local vel2 = util.clamp(vel_base + math.random(-hvel, hvel), 1, 127)
 
-        -- ratchet handling: multiply pattern r by global ratchet
         local rpat = st.r or 1
         local rglob = params:get("arp_step_ratchet") or 1
         local rat_total = math.max(1, math.floor(rpat * rglob))
@@ -640,13 +694,11 @@ local Arp = (function()
     return util.clamp(base + o*12 + tr, 0, 127)
   end
 
-  private = {}
   local function step_once_legacy()
     all_off()
     if not A.running then return end
     local wait = step_seconds()
 
-    -- global step probability
     local gprob = (params:get("arp_step_prob") or 100) / 100
     if math.random() > gprob then
       A.step_i = A.step_i + 1
@@ -743,7 +795,6 @@ local Arp = (function()
   local function set_enable(v) A.pat_enable = (v==2); if A.pat_enable then select_pattern() end end
   local function set_genre_idx(i) local g = PatternLib.GENRES[i] or "Pop"; A.pat_genre = g; A.cur_pat=nil; select_pattern() end
   local function set_pat_idx(i) A.pat_index = i or 1; A.cur_pat=nil; select_pattern() end
-  private = {}
   local function set_rand(v) A.pat_random_on_chord = (v==2) end
 
   return {
@@ -955,6 +1006,77 @@ local function build_chord_and_symbol(root_note, deg)
   return notes, symbol, qual, name_root_midi
 end
 
+-- schedule one full strum pass; optionally re-schedule itself for repeating
+local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, tid, cycle_idx, hold_guard)
+  local chord = select(1, build_chord_and_symbol(root_note, deg))
+  if not chord or #chord == 0 then return end
+
+  local order = make_strum_order(#chord)
+  local offs  = Feel.step_offsets_one_index(
+    #order, S.strum_steps or 0,
+    params:get("chorder_timing_shape") or 1,
+    params:get("chorder_timing_amt")   or 50,
+    params:get("chorder_timing_skip_steps") or 1
+  )
+
+  local sorted = (function(t) local c={}; for i,n in ipairs(t) do c[i]=n end; table.sort(c); return c end)(chord)
+  local idx_in_sorted = {}; for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
+  local n_sorted = #sorted
+
+  local flam_on    = (params:get("chorder_flam") or 1) == 2
+  local flam_cnt   = params:get("chorder_flam_count") or 0
+  local flam_space = params:get("chorder_flam_space") or 1
+  local flam_dvel  = params:get("chorder_flam_vel") or -8
+
+  local pass_last = 0
+  for k, idx in ipairs(order) do
+    local n = chord[idx]
+    local base = util.clamp((incoming_vel or 100)
+                  + math.random(-(S.humanize_vel_range or 0),(S.humanize_vel_range or 0)), 1, 127)
+    local pos_in_sorted = idx_in_sorted[n] or 1
+    local v = Feel.apply_velocity(
+      k, #order, base, pos_in_sorted, n_sorted,
+      params:get("chorder_ramp_per_step") or 0,
+      params:get("chorder_accent") or 1,
+      params:get("chorder_accent_amt") or 0
+    )
+    local s0 = offs[k] or 0
+    local s  = s0 + math.random(0, S.humanize_steps_max or 0)
+    pass_last = math.max(pass_last, s0 + (flam_on and (flam_cnt*flam_space) or 0))
+
+    schedule(s, function()
+      if (not hold_guard) or (S.chord_hold_tokens[root_note] == tid) then
+        fanout_note_on(canon, n, v)
+      end
+    end)
+
+    if flam_on and flam_cnt > 0 then
+      for j=1, flam_cnt do
+        local ds = s + j * flam_space
+        local vv = util.clamp(v + j * flam_dvel, 1, 127)
+        schedule(ds, function()
+          if (not hold_guard) or (S.chord_hold_tokens[root_note] == tid) then
+            fanout_note_on(canon, n, vv)
+          end
+        end)
+      end
+    end
+  end
+
+  local repeat_on = (params:get("chorder_strum_repeat") or 1) == 2
+  if repeat_on then
+    local gap = params:get("chorder_strum_repeat_gap") or 0
+    local max_cycles = params:get("chorder_strum_repeat_cycles") or 0
+    local next_idx = (cycle_idx or 1) + 1
+    local should_continue = (max_cycles == 0) or (next_idx <= max_cycles)
+    schedule(pass_last + gap + 1, function()
+      if should_continue and S.chord_hold_tokens[root_note] == tid then
+        schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, tid, next_idx, hold_guard)
+      end
+    end)
+  end
+end
+
 local function handle_note_on(canon, root_note, vel, deg)
   if S.chord_active[root_note] then
     for _,n in ipairs(S.chord_active[root_note]) do fanout_note_off(canon, n) end
@@ -968,54 +1090,12 @@ local function handle_note_on(canon, root_note, vel, deg)
   Arp.refresh()
   Arp.chord_key(true)
 
-  local order = make_strum_order(#chord)
-
-  -- FIX: use 1-based offsets (to match Lua and Free Play)
-  local offs = Feel.step_offsets_one_index(
-    #order,
-    S.strum_steps or 0,
-    params:get("chorder_timing_shape") or 1,
-    params:get("chorder_timing_amt") or 50,
-    params:get("chorder_timing_skip_steps") or 1
-  )
-
-  local sorted = (function(t) local c={}; for i,n in ipairs(t) do c[i]=n end; table.sort(c); return c end)(chord)
-  local idx_in_sorted = {}; for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
-  local n_sorted = #sorted
-
-  local flam_on    = (params:get("chorder_flam") or 1) == 2
-  local flam_cnt   = params:get("chorder_flam_count") or 0
-  local flam_space = params:get("chorder_flam_space") or 1
-  local flam_dvel  = params:get("chorder_flam_vel") or -8
-
-  local hold_on = (params:get("chorder_hold_strum") or 1) == 2
+  local hold_on   = (params:get("chorder_hold_strum") or 1) == 2
+  local repeat_on = (params:get("chorder_strum_repeat") or 1) == 2
   local tid = next_trigger_id()
-  if hold_on then S.chord_hold_tokens[root_note] = tid end
+  if hold_on or repeat_on then S.chord_hold_tokens[root_note] = tid end
 
-  for k,idx in ipairs(order) do
-    local n = chord[idx]
-    local s = (offs[k] or 0) + math.random(0, S.humanize_steps_max or 0)
-    local v_base = util.clamp((vel or 100) + math.random(-(S.humanize_vel_range or 0),(S.humanize_vel_range or 0)), 1, 127)
-    local pos_in_sorted = idx_in_sorted[n] or 1
-    local v = Feel.apply_velocity(
-      k, #order, v_base, pos_in_sorted, n_sorted,
-      params:get("chorder_ramp_per_step") or 0,
-      params:get("chorder_accent") or 1,
-      params:get("chorder_accent_amt") or 0
-    )
-    schedule(s, function()
-      if (not hold_on) or (S.chord_hold_tokens[root_note] == tid) then fanout_note_on(canon, n, v) end
-    end)
-    if flam_on and flam_cnt > 0 then
-      for j=1, flam_cnt do
-        local ds = s + j * flam_space
-        local vv = util.clamp(v + j * flam_dvel, 1, 127)
-        schedule(ds, function()
-          if (not hold_on) or (S.chord_hold_tokens[root_note] == tid) then fanout_note_on(canon, n, vv) end
-        end)
-      end
-    end
-  end
+  schedule_chord_strum_pass(canon, root_note, vel, deg, tid, 1, hold_on)
 end
 
 local function handle_note_off(canon, root_note)
@@ -1081,7 +1161,7 @@ local function free_handle_note_on(in_note, in_vel)
   local idx_in_sorted = {}; for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
   local n_sorted = #sorted
 
-  local hold_on = (params:get("free_hold_strum") or 1) == 2
+  local hold_on = S.free.hold_to_strum or param_is_on("free_hold_strum")
   local tid = next_trigger_id()
   if hold_on then S.free.hold_tokens[in_note] = tid end
 
@@ -1093,9 +1173,9 @@ local function free_handle_note_on(in_note, in_vel)
     local pos_in_sorted = idx_in_sorted[n] or 1
     local v = Feel.apply_velocity(
       k, #ord, v_base, pos_in_sorted, n_sorted,
-      params:get("free_ramp_per_step") or 0,
-      params:get("free_accent") or 1,
-      params:get("free_accent_amt") or 0
+      params:get("free_ramp_per_step") or S.free.ramp_per_step or 0,
+      params:get("free_accent") or S.free.accent or 1,
+      params:get("free_accent_amt") or S.free.accent_amt or 0
     )
     free_schedule(s, function()
       if (not hold_on) or (S.free.hold_tokens[in_note] == tid) then Free.fanout_on(fcanon, n, v); Free.gate_for(n) end
@@ -1129,12 +1209,13 @@ local function free_handle_note_off(in_note)
     local q = S.free.active_map[in_note]
     if q ~= nil then
       S.free.active_map[in_note] = nil
+      S.free_note_to_off = q
       local fcanon = S.canonical_names[S.free.voice_index] or ""
       Free.fanout_off(fcanon, q)
     end
     return
   end
-  if (params:get("free_hold_strum") or 1) == 2 then S.free.hold_tokens[in_note] = nil end
+  if S.free.hold_to_strum or param_is_on("free_hold_strum") then S.free.hold_tokens[in_note] = nil end
   local outs = S.free.chord_active[in_note]
   if outs then
     local fcanon = S.canonical_names[S.free.voice_index] or ""
@@ -1282,11 +1363,6 @@ function redraw()
 end
 
 -- ===== group-builder (2-pass param counting) =====
-local _sep_seen = {}
-local function div(label)
-  return function() params:add_separator(("— %s —"):format(label or "")) end
-end
-
 local function build_group(title, builders)
   local real = params
   local counter = 0
@@ -1311,11 +1387,12 @@ local function build_group(title, builders)
   for _,fn in ipairs(builders) do fn() end
   params = real
 
-  -- create group with exact count
   params:add_group(title, counter)
-
-  -- pass 2: real adds
   for _,fn in ipairs(builders) do fn() end
+end
+
+local function div(label)
+  return function() params:add_separator(("— %s —"):format(label or "")) end
 end
 
 -- ===== MIDI In setup =====
@@ -1436,9 +1513,10 @@ local function rebuild_midi_lists()
 end
 
 -- ===== lifecycle utils =====
-local function show_param(id, show) if show then params:show(id) else params:hide(id) end end
+local function show_param(id, show) local p=params:lookup_param(id); if not p then return end; if show then params:show(id) else params:hide(id) end end
 
 local function update_free_visibility()
+  -- Only toggle params that actually exist
   local chroma = (S.free.key_mode == 3)
   show_param("free_mode",                not chroma)
   show_param("free_chord_type",          not chroma)
@@ -1448,23 +1526,12 @@ local function update_free_visibility()
   show_param("free_voicing",             not chroma)
   show_param("free_add_bass",            not chroma)
   show_param("free_strum_steps",         not chroma)
-  -- FIX: typo chromma -> chroma
   show_param("free_strum_type",          not chroma)
-  show_param("free_timing_shape",        not chroma)
-  show_param("free_timing_amt",          not chroma)
-  show_param("free_timing_skip_steps",   not chroma)
-  show_param("free_hum_steps",           not chroma)
-  show_param("free_hum_vel",             not chroma)
-  show_param("free_ramp_per_step",       not chroma)
-  show_param("free_accent",              not chroma)
-  show_param("free_accent_amt",          not chroma)
-  show_param("free_flam",                not chroma)
-  show_param("free_flam_count",          not chroma)
-  show_param("free_flam_space",          not chroma)
-  show_param("free_flam_vel",            not chroma)
-  show_param("free_swing_mode",          not chroma)
-  show_param("free_swing_pct",           not chroma)
-  show_param("free_quantize",            not chroma)
+  show_param("free_hold_strum",          not chroma)
+  -- velocity/gate always visible
+  show_param("free_vel_fixed",           true)
+  show_param("free_gate_mode",           true)
+  -- dynamics & flam remain visible (safe)
 end
 
 -- ===== sections (using build_group) =====
@@ -1621,8 +1688,13 @@ local function add_timing_section()
       params:set_action("chorder_quantize", function(i) S.quantize = (i==2); redraw() end)
     end,
     function()
-      params:add_option("chorder_quant_div", "quantize division", K.QUANT_DIV_OPTS, 4) -- index 4 is 1/1 in reordered list
-      params:set_action("chorder_quant_div", function(i) S.tick_div_str = K.QUANT_DIV_OPTS[i]; S.tick_div = K.QUANT_DIV_MAP[S.tick_div_str] or 1/4; redraw() end)
+      ensure_quant_div_tables(); safe_add_option("chorder_quant_div", "quantize division", K.QUANT_DIV_OPTS, 4)
+      params:set_action("chorder_quant_div", function(i)
+        ensure_quant_div_tables()
+        S.tick_div_str = K.QUANT_DIV_OPTS[i] or "1/4"
+        S.tick_div = K.QUANT_DIV_MAP[S.tick_div_str] or 1/4
+        redraw()
+      end)
     end,
     function()
       params:add_option("chorder_swing_mode", "swing mode", {"grid","swing %"}, S.swing_mode)
@@ -1643,9 +1715,17 @@ local function add_timing_section()
     end,
     function()
       params:add_option("chorder_strum_type", "strum type", K.STRUM_OPTS, S.strum_type)
-      params:set_action("chorder_strum_type", function(i) S.strum_type = i; strum_state = { alt_flip=false, last_first=nil, last_last=nil }; redraw() end)
+      params:set_action("chorder_strum_type", function(i)
+        S.strum_type = i
+        -- reset alternating memory so patterns start deterministically
+        strum_state = { alt_flip=false, last_first=nil, last_last=nil }
+        redraw()
+      end)
     end,
     function() params:add_option("chorder_hold_strum", "hold-to-strum (Chord)", {"off","on"}, 1) end,
+    function() params:add_option("chorder_strum_repeat", "repeat strum", {"off","on"}, 1) end,
+    function() params:add_number("chorder_strum_repeat_gap", "repeat gap (steps)", 0, 8, 0) end,
+    function() params:add_number("chorder_strum_repeat_cycles", "repeat cycles (0=inf)", 0, 32, 0) end,
 
     div("Timing · Timing Shapes"),
     function()
@@ -1745,27 +1825,24 @@ local function add_free_section()
 
     div("Free · Strum"),
     function() params:add_number("free_strum_steps", "strum (steps of division)", 0, 8, S.free.strum_steps); params:set_action("free_strum_steps", function(v) S.free.strum_steps = util.clamp(v,0,8) end) end,
-    function() params:add_option("free_strum_type", "strum type", K.STRUM_OPTS, S.free.strum_type); params:set_action("free_strum_type", function(i) S.free.strum_type = i end) end,
-    function() params:add_option("free_hold_strum", "hold-to-strum (Free)", {"off","on"}, 1) end,
-
-    div("Free · Timing"),
-    function() params:add_option("free_timing_shape", "timing shape", {"straight","serpentine","accelerando","ritardando","rake ease-in","rake ease-out","skip alt gaps"}, S.free.timing_shape); params:set_action("free_timing_shape", function(i) S.free.timing_shape = i end) end,
-    function() params:add_number("free_timing_amt", "timing amount", 0, 100, S.free.timing_amt); params:set_action("free_timing_amt", function(v) S.free.timing_amt = util.clamp(v,0,100) end) end,
-    function() params:add_number("free_timing_skip_steps", "skip size (steps)", 0, 8, S.free.timing_skip_steps); params:set_action("free_timing_skip_steps", function(v) S.free.timing_skip_steps = util.clamp(v,0,8) end) end,
-
-    div("Free · Swing & Quantize"),
-    function() params:add_option("free_swing_mode", "swing mode", {"grid","swing %"}, S.free.swing_mode) end,
-    function() params:add_number("free_swing_pct", "swing %", 0, 75, S.free.swing_pct); params:set_action("free_swing_pct", function(v) S.free.swing_pct = util.clamp(v,0,75) end) end,
-    function() params:add_option("free_quantize", "quantize free hits", {"off","on"}, (S.free.quantize and 2 or 1)); params:set_action("free_quantize", function(i) S.free.quantize = (i==2) end) end,
-
-    div("Free · Humanize"),
-    function() params:add_number("free_hum_steps", "humanize timing (max steps)", 0, 4, S.free.hum_steps_max); params:set_action("free_hum_steps", function(v) S.free.hum_steps_max = util.clamp(v,0,4) end) end,
-    function() params:add_number("free_hum_vel", "humanize velocity (+/-)", 0, 30, S.free.hum_vel_range); params:set_action("free_hum_vel", function(v) S.free.hum_vel_range = util.clamp(v,0,30) end) end,
+    function() params:add_option("free_strum_type", "strum type", K.STRUM_OPTS, S.free.strum_type)
+      params:set_action("free_strum_type", function(i) S.free.strum_type = i end)
+    end,
+    function()
+      params:add_option("free_hold_strum", "hold-to-strum (Free)", {"off","on"}, 1)
+      params:set_action("free_hold_strum", function(i) S.free.hold_to_strum = (i == 2) end)
+    end,
 
     div("Free · Dynamics"),
-    function() params:add_number("free_ramp_per_step", "velocity ramp / step", -24, 24, S.free.ramp_per_step) end,
-    function() params:add_option("free_accent", "accent target", {"none","bass","top","middle"}, S.free.accent) end,
-    function() params:add_number("free_accent_amt", "accent amount", -30, 30, S.free.accent_amt) end,
+    function() params:add_number("free_ramp_per_step", "velocity ramp / step", -24, 24, S.free.ramp_per_step)
+      params:set_action("free_ramp_per_step", function(v) S.free.ramp_per_step = util.clamp(v, -24, 24) end)
+    end,
+    function() params:add_option("free_accent", "accent target", {"none","bass","top","middle"}, S.free.accent)
+      params:set_action("free_accent", function(i) S.free.accent = i end)
+    end,
+    function() params:add_number("free_accent_amt", "accent amount", -30, 30, S.free.accent_amt)
+      params:set_action("free_accent_amt", function(v) S.free.accent_amt = util.clamp(v, -30, 30) end)
+    end,
 
     div("Free · Flam"),
     function() params:add_option("free_flam", "flam", {"off","on"}, S.free.flam) end,
@@ -1774,10 +1851,6 @@ local function add_free_section()
     function() params:add_number("free_flam_vel", "flam vel delta", -30, 0, S.free.flam_vel) end,
 
     div("Free · Velocity & Gate"),
-    function()
-      params:add_option("free_vel_mode", "velocity src (free)", {"fixed","incoming"}, S.free.velocity_mode)
-      params:set_action("free_vel_mode", function(i) S.free.velocity_mode = i; show_param("free_vel_fixed", i==1) end)
-    end,
     function()
       params:add_number("free_vel_fixed", "fixed velocity", 1, 127, S.free.fixed_velocity)
       params:set_action("free_vel_fixed", function(v) S.free.fixed_velocity = util.clamp(v,1,127) end)
@@ -1829,64 +1902,34 @@ local function add_arp_section()
     end,
 
     div("ARP · Timing"),
-    function() params:add_option("arp_div", "division", K.QUANT_DIV_OPTS, 9) end, -- default 1/8 (index 9 with reordered list)
+    function() ensure_quant_div_tables(); safe_add_option("arp_div", "division", K.QUANT_DIV_OPTS, 9) end, -- default 1/8
     function() params:add_option("arp_swing_mode", "swing mode", {"grid","swing %"}, 1) end,
     function() params:add_number("arp_swing_pct", "swing %", 0, 75, 0) end,
 
     div("ARP · Material"),
     function() params:add_option("arp_material", "material", {"chord tones","chord + passing"}, 2) end,
 
-    div("ARP · Order & Range"),
-    function() params:add_option("arp_order", "order", K.STRUM_OPTS, 1) end,
-    function() params:add_number("arp_octaves", "octave span", 0, 3, 1) end,
-    function() params:add_option("arp_oct_walk", "octave walk", {"wrap","bounce"}, 1) end,
+    div("ARP · Order"),
+    function()
+      params:add_option("arp_order", "order", K.STRUM_OPTS, 1)
+      params:set_action("arp_order", function(i) S.arp_order_idx = i end)
+    end,
 
-    div("ARP · Patterns"),
-        function()
-          params:add_option("arp_pat_enable", "pattern mode", {"off","on"}, 1)
-          params:set_action("arp_pat_enable", function(i) Arp.set_pat_enable(i) end)
-        end,
-        function()
-          params:add_option("arp_pat_genre", "pattern genre", PatternLib.GENRES, 1)
-          params:set_action("arp_pat_genre", function(i)
-            local g = PatternLib.GENRES[i] or "Pop"
-            local names = PatternLib.NAMES_FOR(g)
-            local p = params:lookup_param("arp_pat_name")
-            if p then p.options = names; p.count = #names; params:set("arp_pat_name", 1) end
-            Arp.set_genre(i); Arp.set_pat(1)
-          end)
-        end,
-        function()
-          params:add_option("arp_pat_name", "pattern", PatternLib.NAMES_FOR(PatternLib.GENRES[1]), 1)
-          params:set_action("arp_pat_name", function(i) Arp.set_pat(i) end)
-        end,
-        function()
-          params:add_option("arp_pat_random", "random pattern on chord", {"off","on"}, 1)
-          params:set_action("arp_pat_random", function(i) Arp.set_rand(i) end)
-        end,
-
-    div("ARP · Probability & Ratchet"),
-    function() params:add_number("arp_step_prob", "step probability (%)", 0, 100, 100) end,
-    function() params:add_number("arp_step_ratchet", "ratchet (x)", 1, 8, 1) end,
-    function() params:add_number("arp_ratchet_prob", "ratchet probability (%)", 0, 100, 100) end,
-
-    div("ARP · Transpose"),
-    function() params:add_number("arp_transpose_oct", "transpose (oct)", -4, 4, 0) end,
-
-    div("ARP · Humanize"),
+    div("ARP · Feel / Humanize"),
+    function() params:add_number("arp_vel", "base velocity", 1, 127, 100) end,
+    function() params:add_number("arp_vel_ramp", "velocity ramp/step", -24, 24, 0) end,
     function() params:add_number("arp_hum_steps", "humanize timing (max steps)", 0, 4, 0) end,
     function() params:add_number("arp_hum_vel", "humanize velocity (+/-)", 0, 30, 0) end,
+    function() params:add_option("arp_gate", "gate", {"release","25%","50%","75%","100%"}, 1) end,
+    function() params:add_number("arp_step_prob", "global step probability %", 0, 100, 100) end,
+    function() params:add_number("arp_step_ratchet", "global ratchet x", 1, 8, 1) end,
+    function() params:add_number("arp_ratchet_prob", "ratchet hit %", 0, 100, 100) end,
 
-    div("ARP · Velocity & Gate"),
-    function() params:add_number("arp_vel", "base velocity", 1, 127, 100) end,
-    function() params:add_number("arp_vel_ramp", "vel ramp/step", -24, 24, 0) end,
-    function() params:add_option("arp_gate", "gate", {"release","25%","50%","75%","100%"}, 3) end,
-
-    div("ARP · Levels"),
-    function()
-      params:add_number("arp_mx_vol_pct", "arpeggio mx volume (%)", 0, 200, S.arp_mx_vol_pct)
-      params:set_action("arp_mx_vol_pct", function(v) S.arp_mx_vol_pct = util.clamp(math.floor(v or 100), 0, 200) end)
-    end,
+    div("ARP · Pattern Library"),
+    function() params:add_option("arp_pat_enable", "use pattern library", {"off","on"}, 1); params:set_action("arp_pat_enable", function(i) Arp.set_pat_enable(i) end) end,
+    function() params:add_option("arp_pat_genre", "genre", (function() local t=PatternLib.GENRES; table.sort(t); return t end)(), 1); params:set_action("arp_pat_genre", function(i) Arp.set_genre(i) end) end,
+    function() params:add_number("arp_pat_index", "pattern index", 1, 256, 1); params:set_action("arp_pat_index", function(i) Arp.set_pat(i) end) end,
+    function() params:add_option("arp_pat_random_on_chord", "new random each chord", {"off","on"}, 1); params:set_action("arp_pat_random_on_chord", function(i) Arp.set_rand(i) end) end,
   })
 end
 
@@ -1933,7 +1976,7 @@ function init()
   show_param("chorder_inversion", S.voicing ~= 11)
   show_param(S.midi.gate_param, want_midi())
   show_param("free_vel_fixed", S.free.velocity_mode == 1)
-  show_param("free_gate_mode", Free.want_midi())
+  show_param("free_gate_mode", true)
   update_free_visibility()
 
   recompute_root_midi()
