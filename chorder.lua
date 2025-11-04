@@ -112,12 +112,37 @@ local function next_trigger_id() S.trigger_seq = S.trigger_seq + 1; return S.tri
 local K = {
   NOTE_NAMES_SHARP = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"},
   STRUM_OPTS = {
-    "up","down","up/down","down/up","random","center-out","outside-in","bass-bounce","treble-bounce",
-    "random no-repeat first","random stable ends","edge-kiss","ping-pair","arp chunk 2–3","guitar rake",
-    "harp gliss split","arp chunk 2–3 ↓","guitar rake ↓","harp gliss split (interleaved)","bass→random",
-    "top→random","outer→random-mid","weave low↔high","weave high↔low","inside-out (alt)","inside-out (random)",
-    "odds↑ then evens↑","evens↑ then odds↑","low-half↑ then high-half↓",
+    "up",
+    "down",
+    "up/down",
+    "down/up",
+    "random",
+    "center-out",
+    "outside-in",
+    "bass-bounce",
+    "treble-bounce",
+    "random no-repeat first",
+    "random stable ends",
+    "edge-kiss",
+    "ping-pair",
+    "arp chunk 2–3",
+    "guitar rake",
+    "harp gliss split",
+    "arp chunk 2–3 ↓",
+    "guitar rake ↓",
+    "harp gliss split (interleaved)",
+    "bass→random",
+    "top→random",
+    "outer→random-mid",
+    "weave low↔high",
+    "weave high↔low",
+    "inside-out (alt)",
+    "inside-out (random)",
+    "odds↑ then evens↑",
+    "evens↑ then odds↑",
+    "low-half↑ then high-half↓",
   },
+  -- reordered in decreasing order
   QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"},
   QUANT_DIV_MAP  = {
     ["4/1"]=4/1, ["3/1"]=3/1, ["2/1"]=2/1, ["1/1"]=1/1, ["1/2"]=1/2, ["1/3"]=1/3, ["1/4"]=1/4,
@@ -651,9 +676,22 @@ local Arp = (function()
     local ord = build_order(); if #ord==0 then return nil end
     local idx = ord[((step_idx-1) % #ord) + 1]
     local base = A.notes_buf[idx]
-    local span = params:get("arp_transpose_oct") or 0 -- only transpose in this build
-    local tr = (span or 0) * 12
-    return util.clamp(base + tr, 0, 127)
+    local span = params:get("arp_octaves") or 1
+    local walk = params:get("arp_oct_walk") or 1 -- 1=wrap, 2=bounce
+    local t = math.floor((step_idx-1)/#ord)
+    local o
+    if span<=0 then o=0
+    else
+      if walk==2 then
+        local period = span*2
+        local p = (period==0) and 0 or (t % period)
+        o = (p<=span) and p or (period - p)
+      else
+        o = t % (span+1) -- wrap
+      end
+    end
+    local tr = (params:get("arp_transpose_oct") or 0) * 12
+    return util.clamp(base + o*12 + tr, 0, 127)
   end
 
   local function step_once_legacy()
@@ -755,24 +793,14 @@ local Arp = (function()
   end
 
   local function set_enable(v) A.pat_enable = (v==2); if A.pat_enable then select_pattern() end end
-  local function set_genre_idx(i)
-    local sorted = { table.unpack(PatternLib.GENRES) }
-    table.sort(sorted)
-    local g = sorted[i] or "Pop"
-    A.pat_genre = g; A.cur_pat=nil; select_pattern()
-  end
+  local function set_genre_idx(i) local g = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()[i] or "Pop"; A.pat_genre = g; A.cur_pat=nil; select_pattern() end
   local function set_pat_idx(i) A.pat_index = i or 1; A.cur_pat=nil; select_pattern() end
   local function set_rand(v) A.pat_random_on_chord = (v==2) end
-
-  -- getters to support UI refresh outside this closure
-  local function get_genre() return A.pat_genre end
-  local function get_pat_index() return A.pat_index end
 
   return {
     start=start, stop=stop, refresh=make_material, chord_key=chord_key,
     setup_midi_out=setup_midi_out, hotplug_refresh=hotplug_refresh,
-    set_pat_enable=set_enable, set_genre=set_genre_idx, set_pat=set_pat_idx, set_rand=set_rand,
-    get_genre=get_genre, get_pat_index=get_pat_index
+    set_pat_enable=set_enable, set_genre=set_genre_idx, set_pat=set_pat_idx, set_rand=set_rand
   }
 end)()
 
@@ -1488,6 +1516,7 @@ end
 local function show_param(id, show) local p=params:lookup_param(id); if not p then return end; if show then params:show(id) else params:hide(id) end end
 
 local function update_free_visibility()
+  -- Only toggle params that actually exist
   local chroma = (S.free.key_mode == 3)
   show_param("free_mode",                not chroma)
   show_param("free_chord_type",          not chroma)
@@ -1499,8 +1528,10 @@ local function update_free_visibility()
   show_param("free_strum_steps",         not chroma)
   show_param("free_strum_type",          not chroma)
   show_param("free_hold_strum",          not chroma)
+  -- velocity/gate always visible
   show_param("free_vel_fixed",           true)
   show_param("free_gate_mode",           true)
+  -- dynamics & flam remain visible (safe)
 end
 
 -- ===== sections (using build_group) =====
@@ -1686,6 +1717,7 @@ local function add_timing_section()
       params:add_option("chorder_strum_type", "strum type", K.STRUM_OPTS, S.strum_type)
       params:set_action("chorder_strum_type", function(i)
         S.strum_type = i
+        -- reset alternating memory so patterns start deterministically
         strum_state = { alt_flip=false, last_first=nil, last_last=nil }
         redraw()
       end)
@@ -1868,11 +1900,20 @@ local function add_arp_section()
     function()
       params:add_option("arp_midi_out_ch", "MIDI out ch", (function() local t={} for i=1,16 do t[i]=tostring(i) end; return t end)(), 1)
     end,
+    function()
+      params:add_number("arp_mx_vol_pct", "arp mx volume (%)", 0, 200, S.arp_mx_vol_pct)
+      params:set_action("arp_mx_vol_pct", function(v) S.arp_mx_vol_pct = util.clamp(math.floor(v or 100), 0, 200) end)
+    end,
 
     div("ARP · Timing"),
     function() ensure_quant_div_tables(); safe_add_option("arp_div", "division", K.QUANT_DIV_OPTS, 9) end, -- default 1/8
     function() params:add_option("arp_swing_mode", "swing mode", {"grid","swing %"}, 1) end,
     function() params:add_number("arp_swing_pct", "swing %", 0, 75, 0) end,
+
+    div("ARP · Pitch/Range"),
+    function() params:add_number("arp_transpose_oct", "transpose (oct)", -4, 4, 0) end,
+    function() params:add_number("arp_octaves", "octave span (0-4)", 0, 4, 1) end,
+    function() params:add_option("arp_oct_walk", "octave travel", {"wrap","bounce"}, 1) end,
 
     div("ARP · Material"),
     function() params:add_option("arp_material", "material", {"chord tones","chord + passing"}, 2) end,
@@ -1899,31 +1940,29 @@ local function add_arp_section()
       params:set_action("arp_pat_enable", function(i) Arp.set_pat_enable(i) end)
     end,
     function()
-      -- Genre selection (sorted)
-      local genres_sorted = { table.unpack(PatternLib.GENRES) }
-      table.sort(genres_sorted)
-      params:add_option("arp_pat_genre", "genre", genres_sorted, 1)
+      -- stable, sorted genres
+      local genres = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()
+      params:add_option("arp_pat_genre", "genre", genres, 1)
       params:set_action("arp_pat_genre", function(i)
         Arp.set_genre(i)
-        -- refresh pattern-name list when genre changes
         local p = params:lookup_param("arp_pat_name")
         if p then
-          local current_genre = Arp.get_genre() or "Pop"
-          local names = PatternLib.NAMES_FOR(current_genre)
-          p.options = names; p.count = #names
-          local keep = util.clamp(Arp.get_pat_index() or 1, 1, #names)
-          params:set("arp_pat_name", keep)
+          local cur_genre = (params:lookup_param("arp_pat_genre").options or genres)[i] or "Pop"
+          p.options = PatternLib.NAMES_FOR(cur_genre)
+          p.count   = #p.options
+          params:set("arp_pat_name", 1)
+          Arp.set_pat(1)
         end
       end)
     end,
     function()
-      -- NEW: show pattern NAME instead of index
-      local init_genre = Arp.get_genre() or "Pop"
-      local init_names = PatternLib.NAMES_FOR(init_genre)
-      params:add_option("arp_pat_name", "pattern", init_names, Arp.get_pat_index() or 1)
-      params:set_action("arp_pat_name", function(i)
-        Arp.set_pat(i)
-      end)
+      local function current_genre()
+        local pg = params:lookup_param("arp_pat_genre")
+        return (pg and pg.options and pg.options[params:get("arp_pat_genre")]) or "Pop"
+      end
+      local names = PatternLib.NAMES_FOR(current_genre())
+      params:add_option("arp_pat_name", "pattern", names, 1)
+      params:set_action("arp_pat_name", function(i) Arp.set_pat(i) end)
     end,
     function()
       params:add_option("arp_pat_random_on_chord", "new random each chord", {"off","on"}, 1)
