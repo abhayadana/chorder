@@ -17,11 +17,11 @@ local DEFAULT_MIDI_OUT_PORT = 1
 
 -- ===== consolidated state =====
 local S = {
-  -- UI pages
-  PAGE_MAIN_IO = 1, PAGE_FREE_IO = 2, PAGE_ARP = 3, PAGE_CHORD = 4, page = 1,
+  -- UI pages (UPDATED ORDER: Main → Free A → Free B → Arp → Chord)
+  PAGE_MAIN_IO = 1, PAGE_FREEA_IO = 2, PAGE_FREEB_IO = 3, PAGE_ARP = 4, PAGE_CHORD = 5, page = 1,
 
   -- cursors (for E2 select / E3 edit UI)
-  cursor = { MAIN=1, FREE=1, ARP=1, CHORD=1 },
+  cursor = { MAIN=1, FREEA=1, FREEB=1, ARP=1, CHORD=1 },
 
   -- root / scale
   root_pc = 0, root_oct = 1, root_midi = 24, scale_name = "Major",
@@ -74,8 +74,10 @@ local S = {
 
   arp_order_idx = 1,
 
-  -- Free Play
-  free = {
+  -- Free Play A (keeps original IDs: free_*)
+  freeA = {
+    id_prefix = "free",    -- param id prefix
+    label = "Free A",
     enable=false, voice_index=1,
     out_mode_param = "free_out_mode",
     out_opts = {"mx.samples","mx.samples + MIDI","MIDI"},
@@ -87,19 +89,55 @@ local S = {
     velocity_mode=2, fixed_velocity=100, gate_mode=1, midi_channel=1,
     -- keying
     key_mode_param = "free_key_mode", key_mode=1,
-    -- chord build / voicing (Free)
+    -- chord build / voicing
     chord_type = 1, sus_mode = 1, inversion = 0, spread = 0, voicing = 1, add_bass = 1,
-    -- dynamics (Free)
+    -- dynamics
     ramp_per_step = 0, accent = 1, accent_amt = 0,
-    -- humanize (Free)
+    -- humanize
     hum_steps_max = 0, hum_vel_range = 0,
-    -- flam (Free)
+    -- flam
     flam = 1, flam_count = 1, flam_space = 1, flam_vel = -8,
     -- mode, transpose
     mode=1, transpose_oct=0,
     -- MIDI ports
     midi_out_dev_param = "free_midi_out_dev", midi_out_ch_param = "free_midi_out_ch",
     midi_in_ch_param  = "free_midi_in_ch",
+    mout=nil,
+    -- live state
+    active_map={}, chord_active={}, hold_tokens={},
+    last_name=nil, last_time=0,
+    mx_vol_pct = 100,
+    hold_to_strum = false,
+  },
+
+  -- Free Play B (new; IDs: freeb_*)
+  freeB = {
+    id_prefix = "freeb",
+    label = "Free B",
+    enable=false, voice_index=1,
+    out_mode_param = "freeb_out_mode",
+    out_opts = {"mx.samples","mx.samples + MIDI","MIDI"},
+    -- timing / strum
+    strum_steps=0, strum_type=1, timing_shape=1, timing_amt=50, timing_skip_steps=1,
+    swing_mode=1, swing_pct=0,
+    quantize=false,
+    -- velocity & gate
+    velocity_mode=2, fixed_velocity=100, gate_mode=1, midi_channel=3,  -- DEFAULT OUT CH = 3
+    -- keying
+    key_mode_param = "freeb_key_mode", key_mode=1,
+    -- chord build / voicing
+    chord_type = 1, sus_mode = 1, inversion = 0, spread = 0, voicing = 1, add_bass = 1,
+    -- dynamics
+    ramp_per_step = 0, accent = 1, accent_amt = 0,
+    -- humanize
+    hum_steps_max = 0, hum_vel_range = 0,
+    -- flam
+    flam = 1, flam_count = 1, flam_space = 1, flam_vel = -8,
+    -- mode, transpose
+    mode=1, transpose_oct=0,
+    -- MIDI ports
+    midi_out_dev_param = "freeb_midi_out_dev", midi_out_ch_param = "freeb_midi_out_ch",
+    midi_in_ch_param  = "freeb_midi_in_ch",
     mout=nil,
     -- live state
     active_map={}, chord_active={}, hold_tokens={},
@@ -172,8 +210,6 @@ local function safe_add_option(id, label, opts, default_index)
 end
 
 -- ===== BLACK KEY MOD CONFIG =====
--- Map black-key pitch classes → mod name
--- defaults: C#(1)=7th, D#(3)=9th, F#(6)=sus2, G#(8)=sus4, A#(10)=mono
 S.black_mod_map = { [1]="7th", [3]="9th", [6]="sus2", [8]="sus4", [10]="mono" }
 local BLACK_PC_LIST = {1,3,6,8,10}
 local BLACK_PC_NAME = { [1]="C#", [3]="D#", [6]="F#", [8]="G#", [10]="A#" }
@@ -226,10 +262,10 @@ local function mod_effective_build()
   return eff_chord_type, eff_sus_mode, eff_add_bass, eff_mono
 end
 
--- ===== forward declarations for upvalues used by closures =====
-local rebind_midi_in_if_needed -- make visible to Arp & UI closures
-local show_param               -- make visible to UI closures
-local setup_midi_in            -- make visible to UI closures
+-- ===== forward declarations =====
+local rebind_midi_in_if_needed
+local show_param
+local setup_midi_in
 
 -- ===== MX module =====
 local MX = (function()
@@ -294,15 +330,15 @@ local MX = (function()
     if not ok then print("mx:on error: "..tostring(err).." (name='"..canon_name.."')") end
   end
 
-  local function mx_on_safe_free(canon_name, midi_note, vel127)
+  local function mx_on_safe_freeL(canon_name, midi_note, vel127, lane_vol_pct)
     canon_name = canon_name or ""; if canon_name=="" then return end
     local ok, err = pcall(function()
       S.mx:on({
         name = canon_name, midi = midi_note, velocity = util.clamp(vel127,1,127),
-        amp = S.free.mx_vol_pct / 100, gain = S.free.mx_vol_pct / 100
+        amp = (lane_vol_pct or 100) / 100, gain = (lane_vol_pct or 100) / 100
       })
     end)
-    if not ok then print("mx:on error: "..tostring(err).." (name='"..canon_name.."')") end
+    if not ok then print("mx:on error (free lane): "..tostring(err).." (name='"..canon_name.."')") end
   end
 
   local function mx_on_safe_arp(canon_name, midi_note, vel127)
@@ -321,7 +357,7 @@ local MX = (function()
     ensure_loaded = ensure_selected_loaded,
     load_folder = load_folder_into_helper,
     on_chord = mx_on_safe_chord,
-    on_free  = mx_on_safe_free,
+    on_freeL = mx_on_safe_freeL,
     on_arp   = mx_on_safe_arp,
     off      = function(canon_name, midi_note)
       if not canon_name or canon_name=="" then return end
@@ -864,84 +900,68 @@ local function fanout_note_off(canon, note)
   if want_midi() then pcall(function() if S.midi.out then S.midi.out:note_off(note, 0, S.midi.channel) end end) end
 end
 
--- ===== Free module =====
+-- ===== Free (lane-generic) =====
 local Free = (function()
-  local function free_want_mx()
-    local mval = params:get(S.free.out_mode_param) or 1
+  local function lane_want_mx(L)
+    local mval = params:get(L.out_mode_param) or 1
     return (mval==1) or (mval==2)
   end
-  local function free_want_midi()
-    local mval = params:get(S.free.out_mode_param) or 1
+  local function lane_want_midi(L)
+    local mval = params:get(L.out_mode_param) or 1
     return (mval==2) or (mval==3)
   end
 
-  local function free_scaled_vel(v)
-    local scaled = math.floor((v or 100) * (S.free.mx_vol_pct / 100))
-    return util.clamp(scaled, 1, 127)
-  end
-
-  local function setup_free_midi_out_awake(param_index)
+  local function setup_lane_midi_out(L, param_index)
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
-    if S.free.mout then S.free.mout.event = nil; S.free.mout = nil end
-    S.free.mout = midi.connect(real_port)
-    if S.free.mout then
-      print("FREE MIDI OUT: connected to "..(midi.vports[real_port].name or ("port "..real_port)))
+    if L.mout then L.mout.event = nil; L.mout = nil end
+    L.mout = midi.connect(real_port)
+    if L.mout then
+      print(L.label.." MIDI OUT: "..(midi.vports[real_port].name or ("port "..real_port)))
     else
-      print("FREE MIDI OUT: connect failed for port "..real_port)
+      print(L.label.." MIDI OUT: connect failed for port "..real_port)
     end
     if rebind_midi_in_if_needed then rebind_midi_in_if_needed() end
   end
 
-  local function free_note_on_mx(canon, note, vel) MX.on_free(canon, note, free_scaled_vel(vel)) end
-  local function free_note_off_mx(canon, note) MX.off(canon, note) end
-
-  private = {}
-  local function free_note_on_midi(note, vel)
-    if S.free.mout then
-      pcall(function() S.free.mout:note_on(util.clamp(note,0,127), util.clamp(vel or 100,1,127), S.free.midi_channel) end)
+  local function lane_fanout_on(L, canon, note, vel)
+    if lane_want_mx(L)   then MX.on_freeL(canon, note, vel, L.mx_vol_pct) end
+    if lane_want_midi(L) and L.mout then
+      pcall(function() L.mout:note_on(util.clamp(note,0,127), util.clamp(vel or 100,1,127), L.midi_channel) end)
     end
   end
-  local function free_note_off_midi(note)
-    if S.free.mout then
-      pcall(function() S.free.mout:note_off(util.clamp(note,0,127), 0, S.free.midi_channel) end)
+  local function lane_fanout_off(L, canon, note)
+    if lane_want_mx(L)   then MX.off(canon, note) end
+    if lane_want_midi(L) and L.mout then
+      pcall(function() L.mout:note_off(util.clamp(note,0,127), 0, L.midi_channel) end)
     end
   end
 
-  local function free_fanout_on(canon, note, vel)
-    if free_want_mx()   then free_note_on_mx(canon, note, vel) end
-    if free_want_midi() then free_note_on_midi(note, vel) end
-  end
-  local function free_fanout_off(canon, note)
-    if free_want_mx()   then free_note_off_mx(canon, note) end
-    if free_want_midi() then free_note_off_midi(note) end
-  end
-
-  local function free_compute_gate_seconds()
-    local sel = S.free.gate_mode or 1
+  local function lane_gate_secs(L)
+    local sel = L.gate_mode or 1
     if sel == 1 then return nil end
     local frac = (sel == 2 and 0.25) or (sel == 3 and 0.50) or (sel == 4 and 0.75) or 1.0
     local bpm = clock.get_tempo()
     return (60 / bpm) * (S.tick_div or 1/4) * frac
   end
 
-  local function free_schedule_gate_for_note(note)
-    local secs = free_compute_gate_seconds()
+  local function lane_gate_for(L, note)
+    local secs = lane_gate_secs(L)
     if not secs or secs <= 0 then return end
     local n = util.clamp(note, 0, 127)
     clock.run(function()
       clock.sleep(secs)
-      if S.free.mout then pcall(function() S.free.mout:note_off(n, 0, S.free.midi_channel) end) end
-      if S.mx then local fcanon = S.canonical_names[S.free.voice_index] or ""; MX.off(fcanon, n) end
+      if L.mout then pcall(function() L.mout:note_off(n, 0, L.midi_channel) end) end
+      if S.mx then local fcanon = S.canonical_names[L.voice_index] or ""; MX.off(fcanon, n) end
     end)
   end
 
-  local function free_active_notes_ascending()
+  local function active_notes_ascending(L)
     local t = {}
-    for _,q in pairs(S.free.active_map) do t[#t+1] = q end
+    for _,q in pairs(L.active_map) do t[#t+1] = q end
     table.sort(t); return t
   end
-  local function free_active_names()
-    local t = free_active_notes_ascending()
+  local function active_names(L)
+    local t = active_notes_ascending(L)
     if #t == 0 then return nil end
     local parts = {}
     for _,n in ipairs(t) do local nm, oc = midi_to_name_oct(n); parts[#parts+1] = string.format("%s%d", nm, oc) end
@@ -953,19 +973,19 @@ local Free = (function()
     return chordlib.quantize_to_scale(sc, note)
   end
 
-  local function free_make_strum_order(count)
+  local function make_order(L, count)
     local tmp_state = { alt_flip=false, last_first=nil, last_last=nil }
-    local ord = select(1, Strum.make(count, S.free.strum_type, tmp_state))
+    local ord = select(1, Strum.make(count, L.strum_type, tmp_state))
     return ord or {}
   end
 
-  local function free_compute_step_offsets(m)
+  local function step_offs(L, m)
     local offs = Feel.step_offsets_one_index(
-      m, S.free.strum_steps or 0, S.free.timing_shape or 1, S.free.timing_amt or 50, S.free.timing_skip_steps or 1
+      m, L.strum_steps or 0, L.timing_shape or 1, L.timing_amt or 50, L.timing_skip_steps or 1
     )
-    if (S.free.swing_mode or 1) == 2 and (S.free.swing_pct or 0) > 0 then
-      local s = util.clamp(S.free.swing_pct, 0, 75) / 100
-      local skew_steps = math.floor((S.free.strum_steps or 0) * s + 0.5)
+    if (L.swing_mode or 1) == 2 and (L.swing_pct or 0) > 0 then
+      local s = util.clamp(L.swing_pct, 0, 75) / 100
+      local skew_steps = math.floor((L.strum_steps or 0) * s + 0.5)
       if skew_steps > 0 then
         for i=1,#offs do
           if (i % 2 == 1) then offs[i] = (offs[i] or 0) + skew_steps
@@ -977,23 +997,23 @@ local Free = (function()
   end
 
   return {
-    setup_midi_out = setup_free_midi_out_awake,
-    fanout_on  = free_fanout_on,
-    fanout_off = free_fanout_off,
-    gate_for   = free_schedule_gate_for_note,
-    act_names  = free_active_names,
-    want_mx    = free_want_mx,
-    want_midi  = free_want_midi,
+    setup_midi_out = setup_lane_midi_out,
+    fanout_on  = lane_fanout_on,
+    fanout_off = lane_fanout_off,
+    gate_for   = lane_gate_for,
+    act_names  = active_names,
+    want_mx    = lane_want_mx,
+    want_midi  = lane_want_midi,
     quantize_to_scale = quantize_to_scale,
-    make_order = free_make_strum_order,
-    step_offs  = free_compute_step_offsets,
+    make_order = make_order,
+    step_offs  = step_offs,
   }
 end)()
 
 -- ===== Event queue / clock =====
 local function queue_in_steps(steps, fn) table.insert(S.evq, {steps=math.max(0, steps), fn=fn}) end
 local function schedule(step_steps, fn) if not S.quantize and step_steps == 0 then fn() else queue_in_steps(step_steps, fn) end end
-local function free_schedule(step_steps, fn) if not S.free.quantize and step_steps == 0 then fn() else queue_in_steps(step_steps, fn) end end
+local function free_schedule(L, step_steps, fn) if not L.quantize and step_steps == 0 then fn() else queue_in_steps(step_steps, fn) end end
 
 local function clock_loop()
   while true do
@@ -1021,6 +1041,8 @@ local function panic_all_outputs()
     for n,_ in pairs(S.midi.active_notes) do pcall(function() S.midi.out:note_off(n, 0, S.midi.channel) end) end
   end
   S.midi.active_notes = {}
+  S.freeA.hold_tokens = {}
+  S.freeB.hold_tokens = {}
 end
 
 -- ===== Chord voice handlers =====
@@ -1118,7 +1140,6 @@ local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, ti
 end
 
 local function handle_note_on(canon, root_note, vel, deg)
-  -- If mono mod is active, play just the incoming note (no chord build/strum)
   local _, _, _, eff_mono = mod_effective_build()
   if eff_mono then
     if S.chord_active[root_note] then
@@ -1136,7 +1157,6 @@ local function handle_note_on(canon, root_note, vel, deg)
     return
   end
 
-  -- Normal chord path
   if S.chord_active[root_note] then
     for _,n in ipairs(S.chord_active[root_note]) do fanout_note_off(canon, n) end
     S.chord_active[root_note] = nil
@@ -1167,23 +1187,23 @@ local function handle_note_off(canon, root_note)
   end
 end
 
--- ===== Free handlers =====
-local function free_handle_note_on(in_note, in_vel)
+-- ===== Free handlers (lane-aware) =====
+local function free_handle_note_on(L, in_note, in_vel)
   local incoming = util.clamp(in_vel or 100, 1, 127)
-  local base_play_vel = (S.free.velocity_mode == 1) and S.free.fixed_velocity or incoming
-  local fcanon = S.canonical_names[S.free.voice_index] or ""
+  local base_play_vel = (L.velocity_mode == 1) and L.fixed_velocity or incoming
+  local fcanon = S.canonical_names[L.voice_index] or ""
 
-  if S.free.key_mode == 3 then
-    local base = util.clamp(in_note + 12 * (S.free.transpose_oct or 0), 0, 127)
-    local v = util.clamp(base_play_vel + math.random(-(S.free.hum_vel_range or 0),(S.free.hum_vel_range or 0)), 1, 127)
-    S.free.active_map[in_note] = base
-    Free.fanout_on(fcanon, base, v); Free.gate_for(base)
+  if L.key_mode == 3 then
+    local base = util.clamp(in_note + 12 * (L.transpose_oct or 0), 0, 127)
+    local v = util.clamp(base_play_vel + math.random(-(L.hum_vel_range or 0),(L.hum_vel_range or 0)), 1, 127)
+    L.active_map[in_note] = base
+    Free.fanout_on(L, fcanon, base, v); Free.gate_for(L, base)
     return
   end
 
   local sc = scale128()
   local deg, base
-  if S.free.key_mode == 1 then
+  if L.key_mode == 1 then
     local pc = in_note % 12
     local d = K.WHITE_TO_DEG[pc]; if not d then return end
     deg = d
@@ -1194,92 +1214,92 @@ local function free_handle_note_on(in_note, in_vel)
     deg = 1 + ((qi - 1) % 7)
     base = qn
   end
-  base = util.clamp(base + 12 * (S.free.transpose_oct or 0), 0, 127)
+  base = util.clamp(base + 12 * (L.transpose_oct or 0), 0, 127)
 
-  if S.free.mode == 1 then
-    local v = util.clamp(base_play_vel + math.random(-(S.free.hum_vel_range or 0),(S.free.hum_vel_range or 0)), 1, 127)
-    S.free.active_map[in_note] = base
-    Free.fanout_on(fcanon, base, v); Free.gate_for(base)
+  if L.mode == 1 then
+    local v = util.clamp(base_play_vel + math.random(-(L.hum_vel_range or 0),(L.hum_vel_range or 0)), 1, 127)
+    L.active_map[in_note] = base
+    Free.fanout_on(L, fcanon, base, v); Free.gate_for(L, base)
     return
   end
 
   local save_voicing, save_add = S.voicing, S.add_bass
-  S.voicing, S.add_bass = S.free.voicing, (S.free.add_bass == 2)
+  S.voicing, S.add_bass = L.voicing, (L.add_bass == 2)
   local notes, qual, name_root_midi = chordlib.build_chord{
     scale=sc, base_midi=base, degree=deg,
-    chord_type=S.free.chord_type, inversion=S.free.inversion, spread=S.free.spread,
-    sus_mode=S.free.sus_mode, voicing_mode=S.free.voicing, add_bass=(S.free.add_bass == 2),
+    chord_type=L.chord_type, inversion=L.inversion, spread=L.spread,
+    sus_mode=L.sus_mode, voicing_mode=L.voicing, add_bass=(L.add_bass == 2),
     last_voiced_notes=nil, last_bass_note=nil
   }
   S.voicing, S.add_bass = save_voicing, save_add
 
   table.sort(notes)
-  local ord = (#notes > 1 and S.free.strum_steps > 0) and Free.make_order(#notes) or (function(n) local t={} for i=1,n do t[i]=i end; return t end)(#notes)
-  local offs = Free.step_offs(#ord)
+  local ord = (#notes > 1 and L.strum_steps > 0) and Free.make_order(L, #notes) or (function(n) local t={} for i=1,n do t[i]=i end; return t end)(#notes)
+  local offs = Free.step_offs(L, #ord)
   local sorted = (function(t) local c={}; for i,n in ipairs(t) do c[i]=n end; table.sort(c); return c end)(notes)
   local idx_in_sorted = {}; for i,n in ipairs(sorted) do if idx_in_sorted[n]==nil then idx_in_sorted[n]=i end end
   local n_sorted = #sorted
 
-  local hold_on = S.free.hold_to_strum or param_is_on("free_hold_strum")
+  local hold_on = L.hold_to_strum or param_is_on(L.id_prefix.."_hold_strum")
   local tid = next_trigger_id()
-  if hold_on then S.free.hold_tokens[in_note] = tid end
+  if hold_on then L.hold_tokens[in_note] = tid end
 
   local emitted = {}
   for k, idx in ipairs(ord) do
     local n = notes[idx]
-    local s = (offs[k] or 0) + math.random(0, S.free.hum_steps_max or 0)
-    local v_base = util.clamp(base_play_vel + math.random(-(S.free.hum_vel_range or 0), (S.free.hum_vel_range or 0)), 1, 127)
+    local s = (offs[k] or 0) + math.random(0, L.hum_steps_max or 0)
+    local v_base = util.clamp(base_play_vel + math.random(-(L.hum_vel_range or 0), (L.hum_vel_range or 0)), 1, 127)
     local pos_in_sorted = idx_in_sorted[n] or 1
     local v = Feel.apply_velocity(
       k, #ord, v_base, pos_in_sorted, n_sorted,
-      params:get("free_ramp_per_step") or S.free.ramp_per_step or 0,
-      params:get("free_accent") or S.free.accent or 1,
-      params:get("free_accent_amt") or S.free.accent_amt or 0
+      L.ramp_per_step or 0,
+      L.accent or 1,
+      L.accent_amt or 0
     )
-    free_schedule(s, function()
-      if (not hold_on) or (S.free.hold_tokens[in_note] == tid) then Free.fanout_on(fcanon, n, v); Free.gate_for(n) end
+    free_schedule(L, s, function()
+      if (not hold_on) or (L.hold_tokens[in_note] == tid) then Free.fanout_on(L, fcanon, n, v); Free.gate_for(L, n) end
     end)
-    if (params:get("free_flam") or S.free.flam) == 2 then
-      local flam_cnt   = params:get("free_flam_count") or S.free.flam_count or 0
-      local flam_space = params:get("free_flam_space") or S.free.flam_space or 1
-      local flam_dvel  = params:get("free_flam_vel") or S.free.flam_vel or -8
+    local flam_on = (params:get(L.id_prefix.."_flam") or L.flam) == 2
+    if flam_on then
+      local flam_cnt   = params:get(L.id_prefix.."_flam_count") or L.flam_count or 0
+      local flam_space = params:get(L.id_prefix.."_flam_space") or L.flam_space or 1
+      local flam_dvel  = params:get(L.id_prefix.."_flam_vel") or L.flam_vel or -8
       for j=1, flam_cnt do
         local ds = s + j * flam_space
         local vv = util.clamp(v + j * flam_dvel, 1, 127)
-        free_schedule(ds, function()
-          if (not hold_on) or (S.free.hold_tokens[in_note] == tid) then Free.fanout_on(fcanon, n, vv); Free.gate_for(n) end
+        free_schedule(L, ds, function()
+          if (not hold_on) or (L.hold_tokens[in_note] == tid) then Free.fanout_on(L, fcanon, n, vv); Free.gate_for(L, n) end
         end)
       end
     end
     emitted[#emitted + 1] = n
   end
-  S.free.chord_active[in_note] = emitted
+  L.chord_active[in_note] = emitted
 
   local symbol = chordlib.symbol_for(notes, qual, name_root_midi, {
-    chord_type=S.free.chord_type, sus_mode=S.free.sus_mode, inversion=S.free.inversion,
-    voicing_mode=S.free.voicing, add_bass=(S.free.add_bass == 2), spread=S.free.spread
+    chord_type=L.chord_type, sus_mode=L.sus_mode, inversion=L.inversion,
+    voicing_mode=L.voicing, add_bass=(L.add_bass == 2), spread=L.spread
   })
-  S.free.last_name = symbol
-  S.free.last_time = util.time()
+  L.last_name = symbol
+  L.last_time = util.time()
 end
 
-local function free_handle_note_off(in_note)
-  if S.free.mode == 1 or S.free.key_mode == 3 then
-    local q = S.free.active_map[in_note]
+local function free_handle_note_off(L, in_note)
+  if L.mode == 1 or L.key_mode == 3 then
+    local q = L.active_map[in_note]
     if q ~= nil then
-      S.free.active_map[in_note] = nil
-      S.free_note_to_off = q
-      local fcanon = S.canonical_names[S.free.voice_index] or ""
-      Free.fanout_off(fcanon, q)
+      L.active_map[in_note] = nil
+      local fcanon = S.canonical_names[L.voice_index] or ""
+      Free.fanout_off(L, fcanon, q)
     end
     return
   end
-  if S.free.hold_to_strum or param_is_on("free_hold_strum") then S.free.hold_tokens[in_note] = nil end
-  local outs = S.free.chord_active[in_note]
+  if L.hold_to_strum or param_is_on(L.id_prefix.."_hold_strum") then L.hold_tokens[in_note] = nil end
+  local outs = L.chord_active[in_note]
   if outs then
-    local fcanon = S.canonical_names[S.free.voice_index] or ""
-    for _,n in ipairs(outs) do Free.fanout_off(fcanon, n) end
-    S.free.chord_active[in_note] = nil
+    local fcanon = S.canonical_names[L.voice_index] or ""
+    for _,n in ipairs(outs) do Free.fanout_off(L, fcanon, n) end
+    L.chord_active[in_note] = nil
   end
 end
 
@@ -1304,7 +1324,7 @@ local function current_midi_out_label(idx) return ellipsize(S.midi.devices[idx o
 local function current_midi_in_label() local i = params:get(S.midi.in_dev_param) or 1; return ellipsize(S.midi.in_devices[i] or "none", 16) end
 local function channel_disp(idx) return (idx==1) and "Omni" or ("Ch"..tostring((idx or 2)-1)) end
 
--- ===== Page items (focus/edit model) =====
+-- ===== Page items =====
 
 local function items_main_io()
   local items = {}
@@ -1336,7 +1356,6 @@ local function items_main_io()
     delta = function(d) params:delta(S.out_mode_param, d) end
   })
 
-  -- If mx, show mx.samples voice and mx volume; else if MIDI present show MIDI device
   do
     local out_short = short_mode_from_param(S.out_mode_param, OUT_OPTS)
     if out_short == "mx" or out_short == "mx+M" then
@@ -1368,6 +1387,7 @@ local function items_main_io()
       })
     end
   end
+
   -- Velocity source (Chord)
   table.insert(items, {
     label = "Vel src",
@@ -1377,7 +1397,6 @@ local function items_main_io()
     end,
     delta = function(d)
       params:delta("chorder_vel_mode", d)
-      -- keep the Setup page's visibility behavior in sync (optional)
       local i = params:get("chorder_vel_mode")
       show_param("chorder_vel_fixed", i == 1)
     end
@@ -1386,58 +1405,59 @@ local function items_main_io()
   return items
 end
 
-local function items_free_io()
+local function items_free_io(L)
   local items = {}
 
   table.insert(items, {
-    label = "Free",
-    value_str = function() return (params:get("free_enable")==2) and "on" or "off" end,
-    delta = function(d) params:delta("free_enable", d) end
+    label = L.label,
+    value_str = function() return (params:get(L.id_prefix.."_enable")==2) and "on" or "off" end,
+    delta = function(d) params:delta(L.id_prefix.."_enable", d) end
   })
 
   table.insert(items, {
     label = "In Ch",
-    value_str = function() return tostring(params:get(S.free.midi_in_ch_param) or 2) end,
-    delta = function(d) params:delta(S.free.midi_in_ch_param, d > 0 and 1 or -1) end
+    value_str = function() return tostring(params:get(L.midi_in_ch_param) or 2) end,
+    delta = function(d) params:delta(L.midi_in_ch_param, d > 0 and 1 or -1) end
   })
+
   table.insert(items, {
     label = "Out",
     value_str = function()
-      return short_mode_from_param(S.free.out_mode_param, S.free.out_opts)
+      return short_mode_from_param(L.out_mode_param, L.out_opts)
     end,
-    delta = function(d) params:delta(S.free.out_mode_param, d) end
+    delta = function(d) params:delta(L.out_mode_param, d) end
   })
 
   do
-    local out_short = short_mode_from_param(S.free.out_mode_param, S.free.out_opts)
+    local out_short = short_mode_from_param(L.out_mode_param, L.out_opts)
     if out_short == "mx" or out_short == "mx+M" then
       table.insert(items, {
         label = "mx.samples",
         value_str = function()
-          return ellipsize(S.display_names[params:get("free_mx_voice") or S.free.voice_index] or "(no packs)", 20)
+          return ellipsize(S.display_names[params:get(L.id_prefix.."_mx_voice") or L.voice_index] or "(no packs)", 20)
         end,
-        delta = function(d) params:delta("free_mx_voice", d) end
+        delta = function(d) params:delta(L.id_prefix.."_mx_voice", d) end
       })
       table.insert(items, {
         label = "mx vol",
-        value_str = function() return tostring(params:get("free_mx_vol_pct") or S.free.mx_vol_pct).."%" end,
-        delta = function(d) params:delta("free_mx_vol_pct", d > 0 and 1 or -1) end
+        value_str = function() return tostring(params:get(L.id_prefix.."_mx_vol_pct") or L.mx_vol_pct).."%" end,
+        delta = function(d) params:delta(L.id_prefix.."_mx_vol_pct", d > 0 and 1 or -1) end
       })
     end
     if out_short == "MIDI" or out_short == "mx+M" then
       table.insert(items, {
         label = "MIDI Out",
         value_str = function()
-          local dev = current_midi_out_label(params:get(S.free.midi_out_dev_param))
-          local ch  = tostring(params:get(S.free.midi_out_ch_param) or 1)
+          local dev = current_midi_out_label(params:get(L.midi_out_dev_param))
+          local ch  = tostring(params:get(L.midi_out_ch_param) or L.midi_channel)
           return dev.." / Ch"..ch
         end,
         delta = function(d)
           if math.abs(d) == 1 then
-            params:delta(S.free.midi_out_dev_param, d)
-            Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
+            params:delta(L.midi_out_dev_param, d)
+            Free.setup_midi_out(L, params:get(L.midi_out_dev_param) or 1)
           else
-            params:delta(S.free.midi_out_ch_param, d > 0 and 1 or -1)
+            params:delta(L.midi_out_ch_param, d > 0 and 1 or -1)
           end
         end
       })
@@ -1508,7 +1528,6 @@ local function items_arp_io()
 end
 
 local function items_chord_page()
-  -- Pull current option labels from params so UI mirrors param sets
   local function option_label(id)
     local p = params:lookup_param(id)
     if not p or not p.options then return "?" end
@@ -1527,7 +1546,6 @@ local function items_chord_page()
       value_str=function() return S.scale_name end,
       delta=function(d) params:delta("chorder_scale", d) end
     },
-    -- On-page editors:
     {
       label="Voicing",
       value_str=function() return option_label("chorder_voicing") end,
@@ -1541,7 +1559,7 @@ local function items_chord_page()
   }
 end
 
--- ===== Page draw with items =====
+-- ===== Page draw =====
 local function draw_items_list(y_start, items, cursor_idx)
   local y = y_start
   for i, it in ipairs(items) do
@@ -1559,11 +1577,11 @@ local function draw_main_io_page()
   draw_items_list(24, items, S.cursor.MAIN)
 end
 
-local function draw_free_io_page()
-  draw_header("Free Play I/O")
-  local items = items_free_io()
-  S.cursor.FREE = clamp_cursor(S.cursor.FREE, #items)
-  draw_items_list(24, items, S.cursor.FREE)
+local function draw_free_io_page(L, cursor_key)
+  draw_header(L.label.." I/O")
+  local items = items_free_io(L)
+  S.cursor[cursor_key] = clamp_cursor(S.cursor[cursor_key], #items)
+  draw_items_list(24, items, S.cursor[cursor_key])
 end
 
 local function draw_arp_io_page()
@@ -1591,15 +1609,16 @@ end
 
 function redraw()
   screen.clear()
-  if     S.page == S.PAGE_MAIN_IO then draw_main_io_page()
-  elseif S.page == S.PAGE_FREE_IO then draw_free_io_page()
-  elseif S.page == S.PAGE_ARP     then draw_arp_io_page()
-  else                                 draw_chord_page()
+  if     S.page == S.PAGE_MAIN_IO  then draw_main_io_page()
+  elseif S.page == S.PAGE_FREEA_IO then draw_free_io_page(S.freeA, "FREEA")
+  elseif S.page == S.PAGE_FREEB_IO then draw_free_io_page(S.freeB, "FREEB")
+  elseif S.page == S.PAGE_ARP      then draw_arp_io_page()
+  else                                   draw_chord_page()
   end
   screen.update()
 end
 
--- ===== group-builder (2-pass param counting) =====
+-- ===== group-builder =====
 local function build_group(title, builders)
   local real = params
   local counter = 0
@@ -1658,10 +1677,14 @@ setup_midi_in = function(param_index)
       chord_ok = (ch_sel_idx == 1) or (msg.ch == (ch_sel_idx - 1))
     end
 
-    local free_ok
+    -- FREE LANE routing by their input channels
+    local freeA_ok = false
+    local freeB_ok = false
     do
-      local free_ch = params:get(S.free.midi_in_ch_param) or 2
-      free_ok = (msg.ch == free_ch)
+      local a_ch = params:get(S.freeA.midi_in_ch_param) or 2
+      local b_ch = params:get(S.freeB.midi_in_ch_param) or 2  -- change default to 3 if you want Free B input on ch3 by default
+      freeA_ok = (msg.ch == a_ch)
+      freeB_ok = (msg.ch == b_ch)
     end
 
     local canon = S.canonical_names[S.voice_index] or ""
@@ -1670,14 +1693,11 @@ setup_midi_in = function(param_index)
     if msg.type == "note_on" and msg.vel > 0 then
       if chord_ok then
         local pc = msg.note % 12
-
         if not K.WHITE_SET[pc] then
-          -- configurable black-key mods
           local m = S.black_mod_map[pc]
           if m then mod_arm(m, true) end
           return
         end
-
         local deg = K.WHITE_TO_DEG[pc]
         if deg then
           MX.ensure_loaded(S.voice_index)
@@ -1685,9 +1705,13 @@ setup_midi_in = function(param_index)
         end
       end
 
-      if S.free.enable and free_ok then
-        local vel = (S.free.velocity_mode == 1) and S.free.fixed_velocity or msg.vel
-        free_handle_note_on(msg.note, vel)
+      if S.freeA.enable and freeA_ok then
+        local vel = (S.freeA.velocity_mode == 1) and S.freeA.fixed_velocity or msg.vel
+        free_handle_note_on(S.freeA, msg.note, vel)
+      end
+      if S.freeB.enable and freeB_ok then
+        local vel = (S.freeB.velocity_mode == 1) and S.freeB.fixed_velocity or msg.vel
+        free_handle_note_on(S.freeB, msg.note, vel)
       end
 
       redraw()
@@ -1702,7 +1726,8 @@ setup_midi_in = function(param_index)
           if m then mod_arm(m, false) end
         end
       end
-      if S.free.enable and free_ok then free_handle_note_off(msg.note) end
+      if S.freeA.enable and freeA_ok then free_handle_note_off(S.freeA, msg.note) end
+      if S.freeB.enable and freeB_ok then free_handle_note_off(S.freeB, msg.note) end
       redraw()
     end
   end
@@ -1728,6 +1753,7 @@ local function rebuild_midi_lists()
   MIDI.build_out()
   MIDI.build_in()
 
+  -- Rebind option lists for chord/arp/free lanes
   params:hide(S.midi.in_dev_param);  params:show(S.midi.in_dev_param)
   local p_in = params:lookup_param(S.midi.in_dev_param)
   if p_in then p_in.options = S.midi.in_devices; p_in.count = #S.midi.in_devices end
@@ -1736,9 +1762,13 @@ local function rebuild_midi_lists()
   local p_out = params:lookup_param(S.midi.out_dev_param)
   if p_out then p_out.options = S.midi.devices; p_out.count = #S.midi.devices end
 
-  params:hide(S.free.midi_out_dev_param); params:show(S.free.midi_out_dev_param)
-  local p_free_out = params:lookup_param(S.free.midi_out_dev_param)
-  if p_free_out then p_free_out.options = S.midi.devices; p_free_out.count = #S.midi.devices end
+  params:hide(S.freeA.midi_out_dev_param); params:show(S.freeA.midi_out_dev_param)
+  local p_free_outA = params:lookup_param(S.freeA.midi_out_dev_param)
+  if p_free_outA then p_free_outA.options = S.midi.devices; p_free_outA.count = #S.midi.devices end
+
+  params:hide(S.freeB.midi_out_dev_param); params:show(S.freeB.midi_out_dev_param)
+  local p_free_outB = params:lookup_param(S.freeB.midi_out_dev_param)
+  if p_free_outB then p_free_outB.options = S.midi.devices; p_free_outB.count = #S.midi.devices end
 
   params:hide("arp_midi_out_dev"); params:show("arp_midi_out_dev")
   local p_arp_out = params:lookup_param("arp_midi_out_dev")
@@ -1767,20 +1797,20 @@ show_param = function(id, show)
   if show then params:show(id) else params:hide(id) end
 end
 
-local function update_free_visibility()
-  local chroma = (S.free.key_mode == 3)
-  show_param("free_mode",                not chroma)
-  show_param("free_chord_type",          not chroma)
-  show_param("free_sus_mode",            not chroma)
-  show_param("free_inversion",           not chroma)
-  show_param("free_spread",              not chroma)
-  show_param("free_voicing",             not chroma)
-  show_param("free_add_bass",            not chroma)
-  show_param("free_strum_steps",         not chroma)
-  show_param("free_strum_type",          not chroma)
-  show_param("free_hold_strum",          not chroma)
-  show_param("free_vel_fixed",           true)
-  show_param("free_gate_mode",           true)
+local function update_free_visibility(L)
+  local chroma = (L.key_mode == 3)
+  show_param(L.id_prefix.."_mode",                not chroma)
+  show_param(L.id_prefix.."_chord_type",          not chroma)
+  show_param(L.id_prefix.."_sus_mode",            not chroma)
+  show_param(L.id_prefix.."_inversion",           not chroma)
+  show_param(L.id_prefix.."_spread",              not chroma)
+  show_param(L.id_prefix.."_voicing",             not chroma)
+  show_param(L.id_prefix.."_add_bass",            not chroma)
+  show_param(L.id_prefix.."_strum_steps",         not chroma)
+  show_param(L.id_prefix.."_strum_type",          not chroma)
+  show_param(L.id_prefix.."_hold_strum",          not chroma)
+  show_param(L.id_prefix.."_vel_fixed",           true)
+  show_param(L.id_prefix.."_gate_mode",           true)
 end
 
 local function update_arp_basics_visibility()
@@ -1795,7 +1825,7 @@ local function update_arp_basics_visibility()
   show_param("arp_oct_walk",is_basics)
 end
 
--- ===== sections (using build_group) =====
+-- ===== sections =====
 local function add_io_section(default_midi_in_index)
   build_group("CHORDER · I/O", {
     div("I/O · Output"),
@@ -1855,11 +1885,13 @@ local function add_io_section(default_midi_in_index)
           p.count   = (#S.display_names>0 and #S.display_names or 1)
           S.voice_index = 1; params:set("chorder_mx_voice", S.voice_index)
         end
-        local pf = params:lookup_param("free_mx_voice")
-        if pf then
-          pf.options = (#S.display_names>0 and S.display_names or {"(no packs)"})
-          pf.count   = (#S.display_names>0 and #S.display_names or 1)
-          S.free.voice_index = 1; params:set("free_mx_voice", S.free.voice_index)
+        for _, lane in ipairs({S.freeA, S.freeB}) do
+          local pid = params:lookup_param(lane.id_prefix.."_mx_voice")
+          if pid then
+            pid.options = (#S.display_names>0 and S.display_names or {"(no packs)"})
+            pid.count   = (#S.display_names>0 and #S.display_names or 1)
+            lane.voice_index = 1; params:set(lane.id_prefix.."_mx_voice", lane.voice_index)
+          end
         end
         local pa = params:lookup_param("arp_mx_voice")
         if pa then
@@ -2030,118 +2062,120 @@ local function add_timing_section()
   })
 end
 
-local function add_free_section()
-  build_group("CHORDER · Free Play", {
-    div("Free · Toggle"),
+local function add_free_lane_section(L, defaults)
+  build_group("CHORDER · "..L.label, {
+    div(L.label.." · Toggle"),
     function()
-      params:add_option("free_enable", "free play", {"off","on"}, 1)
-      params:set_action("free_enable", function(i) S.free.enable = (i==2); if not S.free.enable then panic_all_outputs() end; redraw() end)
+      params:add_option(L.id_prefix.."_enable", "free play", {"off","on"}, 1)
+      params:set_action(L.id_prefix.."_enable", function(i) L.enable = (i==2); if not L.enable then panic_all_outputs() end; redraw() end)
     end,
 
-    div("Free · MIDI In"),
-    function() params:add_option(S.free.midi_in_ch_param, "MIDI input ch", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), 2) end,
-
-    div("Free · Key Input Mode"),
+    div(L.label.." · MIDI In"),
     function()
-      params:add_option(S.free.key_mode_param, "",
-        {"white keys (diatonic degrees)","all keys → quantized to scale","all keys chromatic (mono only)"}, S.free.key_mode)
-      params:set_action(S.free.key_mode_param, function(i)
-        S.free.key_mode = i
-        if S.free.key_mode == 3 then
-          params:set("free_mode", 1); S.free.mode = 1; panic_all_outputs()
+      params:add_option(L.midi_in_ch_param, "MIDI input ch", (function() local t={} for i=1,16 do t[#t+1]=tostring(i) end; return t end)(), defaults.in_ch or 2)
+    end,
+
+    div(L.label.." · Key Input Mode"),
+    function()
+      params:add_option(L.key_mode_param, "",
+        {"white keys (diatonic degrees)","all keys → quantized to scale","all keys chromatic (mono only)"}, L.key_mode)
+      params:set_action(L.key_mode_param, function(i)
+        L.key_mode = i
+        if L.key_mode == 3 then
+          params:set(L.id_prefix.."_mode", 1); L.mode = 1; panic_all_outputs()
         end
-        update_free_visibility(); redraw()
+        update_free_visibility(L); redraw()
       end)
     end,
 
-    div("Free · Instrument & Output"),
+    div(L.label.." · Instrument & Output"),
     function()
-      params:add_option(S.free.out_mode_param, "output", S.free.out_opts, 1)
-      params:set_action(S.free.out_mode_param, function(_) panic_all_outputs(); rebind_midi_in_if_needed(); show_param("free_gate_mode", true); redraw() end)
+      params:add_option(L.out_mode_param, "output", L.out_opts, 1)
+      params:set_action(L.out_mode_param, function(_) panic_all_outputs(); rebind_midi_in_if_needed(); show_param(L.id_prefix.."_gate_mode", true); redraw() end)
     end,
     function()
-      params:add_option("free_mx_voice", "mx.samples", (#S.display_names>0 and S.display_names or {"(no packs)"}), 1)
-      params:set_action("free_mx_voice", function(i) S.free.voice_index = i; MX.ensure_loaded(i); redraw() end)
+      params:add_option(L.id_prefix.."_mx_voice", "mx.samples", (#S.display_names>0 and S.display_names or {"(no packs)"}), 1)
+      params:set_action(L.id_prefix.."_mx_voice", function(i) L.voice_index = i; MX.ensure_loaded(i); redraw() end)
     end,
 
-    div("Free · MIDI Out"),
+    div(L.label.." · MIDI Out"),
     function()
-      params:add_option(S.free.midi_out_dev_param, "MIDI out", S.midi.devices, 1)
-      params:set_action(S.free.midi_out_dev_param, function(i) Free.setup_midi_out(i); panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
+      params:add_option(L.midi_out_dev_param, "MIDI out", S.midi.devices, 1)
+      params:set_action(L.midi_out_dev_param, function(i) Free.setup_midi_out(L, i); panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
     end,
     function()
-      params:add_option(S.free.midi_out_ch_param, "MIDI out ch", (function() local t={} for i=1,16 do t[i]=tostring(i) end; return t end)(), 1)
-      params:set_action(S.free.midi_out_ch_param, function(idx) S.free.midi_channel = idx; panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
+      params:add_option(L.midi_out_ch_param, "MIDI out ch", (function() local t={} for i=1,16 do t[i]=tostring(i) end; return t end)(), defaults.out_ch or 1)
+      params:set_action(L.midi_out_ch_param, function(idx) L.midi_channel = idx; panic_all_outputs(); rebind_midi_in_if_needed(); redraw() end)
     end,
 
-    div("Free · Mode"),
+    div(L.label.." · Mode"),
     function()
-      params:add_option("free_mode", "play mode", {"mono","chord"}, S.free.mode)
-      params:set_action("free_mode", function(i) S.free.mode = i end)
+      params:add_option(L.id_prefix.."_mode", "play mode", {"mono","chord"}, L.mode)
+      params:set_action(L.id_prefix.."_mode", function(i) L.mode = i end)
     end,
 
-    div("Free · Chord Build"),
-    function() params:add_option("free_chord_type", "chord type", {"triad","7th","9th"}, S.free.chord_type); params:set_action("free_chord_type", function(i) S.free.chord_type = i end) end,
-    function() params:add_option("free_sus_mode", "third handling", {"normal","sus2","sus4"}, S.free.sus_mode); params:set_action("free_sus_mode", function(i) S.free.sus_mode = i end) end,
-    function() params:add_number("free_inversion", "inversion (0-3)", 0, 3, S.free.inversion); params:set_action("free_inversion", function(v) S.free.inversion = util.clamp(v,0,3) end) end,
-    function() params:add_number("free_spread", "spread (semitones)", -24, 24, S.free.spread); params:set_action("free_spread", function(v) S.free.spread = util.round(v) end) end,
+    div(L.label.." · Chord Build"),
+    function() params:add_option(L.id_prefix.."_chord_type", "chord type", {"triad","7th","9th"}, L.chord_type); params:set_action(L.id_prefix.."_chord_type", function(i) L.chord_type = i end) end,
+    function() params:add_option(L.id_prefix.."_sus_mode", "third handling", {"normal","sus2","sus4"}, L.sus_mode); params:set_action(L.id_prefix.."_sus_mode", function(i) L.sus_mode = i end) end,
+    function() params:add_number(L.id_prefix.."_inversion", "inversion (0-3)", 0, 3, L.inversion); params:set_action(L.id_prefix.."_inversion", function(v) L.inversion = util.clamp(v,0,3) end) end,
+    function() params:add_number(L.id_prefix.."_spread", "spread (semitones)", -24, 24, L.spread); params:set_action(L.id_prefix.."_spread", function(v) L.spread = util.round(v) end) end,
     function()
-      params:add_option("free_voicing", "voicing",
-        {"none","drop-2","drop-3","drop-2&4","drop-1","open","wide","quartal","quintal","nearest","smooth"}, S.free.voicing)
-      params:set_action("free_voicing", function(i) S.free.voicing = i end)
+      params:add_option(L.id_prefix.."_voicing", "voicing",
+        {"none","drop-2","drop-3","drop-2&4","drop-1","open","wide","quartal","quintal","nearest","smooth"}, L.voicing)
+      params:set_action(L.id_prefix.."_voicing", function(i) L.voicing = i end)
     end,
     function()
-      params:add_option("free_add_bass", "add bass (root -12)", {"off","on"}, S.free.add_bass)
-      params:set_action("free_add_bass", function(i) S.free.add_bass = i end)
+      params:add_option(L.id_prefix.."_add_bass", "add bass (root -12)", {"off","on"}, L.add_bass)
+      params:set_action(L.id_prefix.."_add_bass", function(i) L.add_bass = i end)
     end,
 
-    div("Free · Strum"),
-    function() params:add_number("free_strum_steps", "strum (steps of division)", 0, 8, S.free.strum_steps); params:set_action("free_strum_steps", function(v) S.free.strum_steps = util.clamp(v,0,8) end) end,
-    function() params:add_option("free_strum_type", "strum type", K.STRUM_OPTS, S.free.strum_type)
-      params:set_action("free_strum_type", function(i) S.free.strum_type = i end)
+    div(L.label.." · Strum"),
+    function() params:add_number(L.id_prefix.."_strum_steps", "strum (steps of division)", 0, 8, L.strum_steps); params:set_action(L.id_prefix.."_strum_steps", function(v) L.strum_steps = util.clamp(v,0,8) end) end,
+    function() params:add_option(L.id_prefix.."_strum_type", "strum type", K.STRUM_OPTS, L.strum_type)
+      params:set_action(L.id_prefix.."_strum_type", function(i) L.strum_type = i end)
     end,
     function()
-      params:add_option("free_hold_strum", "hold-to-strum (Free)", {"off","on"}, 1)
-      params:set_action("free_hold_strum", function(i) S.free.hold_to_strum = (i == 2) end)
+      params:add_option(L.id_prefix.."_hold_strum", "hold-to-strum", {"off","on"}, 1)
+      params:set_action(L.id_prefix.."_hold_strum", function(i) L.hold_to_strum = (i == 2) end)
     end,
 
-    div("Free · Dynamics"),
-    function() params:add_number("free_ramp_per_step", "velocity ramp / step", -24, 24, S.free.ramp_per_step)
-      params:set_action("free_ramp_per_step", function(v) S.free.ramp_per_step = util.clamp(v, -24, 24) end)
+    div(L.label.." · Dynamics"),
+    function() params:add_number(L.id_prefix.."_ramp_per_step", "velocity ramp / step", -24, 24, L.ramp_per_step)
+      params:set_action(L.id_prefix.."_ramp_per_step", function(v) L.ramp_per_step = util.clamp(v, -24, 24) end)
     end,
-    function() params:add_option("free_accent", "accent target", {"none","bass","top","middle"}, S.free.accent)
-      params:set_action("free_accent", function(i) S.free.accent = i end)
+    function() params:add_option(L.id_prefix.."_accent", "accent target", {"none","bass","top","middle"}, L.accent)
+      params:set_action(L.id_prefix.."_accent", function(i) L.accent = i end)
     end,
-    function() params:add_number("free_accent_amt", "accent amount", -30, 30, S.free.accent_amt)
-      params:set_action("free_accent_amt", function(v) S.free.accent_amt = util.clamp(v, -30, 30) end)
+    function() params:add_number(L.id_prefix.."_accent_amt", "accent amount", -30, 30, L.accent_amt)
+      params:set_action(L.id_prefix.."_accent_amt", function(v) L.accent_amt = util.clamp(v, -30, 30) end)
     end,
 
-    div("Free · Flam"),
-    function() params:add_option("free_flam", "flam", {"off","on"}, S.free.flam) end,
-    function() params:add_number("free_flam_count", "flam hits (extra)", 0, 3, S.free.flam_count) end,
-    function() params:add_number("free_flam_space", "flam spacing (steps)", 1, 4, S.free.flam_space) end,
-    function() params:add_number("free_flam_vel", "flam vel delta", -30, 0, S.free.flam_vel) end,
+    div(L.label.." · Flam"),
+    function() params:add_option(L.id_prefix.."_flam", "flam", {"off","on"}, L.flam) end,
+    function() params:add_number(L.id_prefix.."_flam_count", "flam hits (extra)", 0, 3, L.flam_count) end,
+    function() params:add_number(L.id_prefix.."_flam_space", "flam spacing (steps)", 1, 4, L.flam_space) end,
+    function() params:add_number(L.id_prefix.."_flam_vel", "flam vel delta", -30, 0, L.flam_vel) end,
 
-    div("Free · Velocity & Gate"),
+    div(L.label.." · Velocity & Gate"),
     function()
-      params:add_number("free_vel_fixed", "fixed velocity", 1, 127, S.free.fixed_velocity)
-      params:set_action("free_vel_fixed", function(v) S.free.fixed_velocity = util.clamp(v,1,127) end)
+      params:add_number(L.id_prefix.."_vel_fixed", "fixed velocity", 1, 127, L.fixed_velocity)
+      params:set_action(L.id_prefix.."_vel_fixed", function(v) L.fixed_velocity = util.clamp(v,1,127) end)
     end,
     function()
-      params:add_option("free_gate_mode", "MIDI gate", {"release","25%","50%","75%","100%"}, S.free.gate_mode)
-      params:set_action("free_gate_mode", function(i) S.free.gate_mode = i end)
-    end,
-
-    div("Free · Levels"),
-    function()
-      params:add_number("free_mx_vol_pct", "free mx volume (%)", 0, 200, S.free.mx_vol_pct)
-      params:set_action("free_mx_vol_pct", function(v) S.free.mx_vol_pct = util.clamp(math.floor(v or 100), 0, 200) end)
+      params:add_option(L.id_prefix.."_gate_mode", "MIDI gate", {"release","25%","50%","75%","100%"}, L.gate_mode)
+      params:set_action(L.id_prefix.."_gate_mode", function(i) L.gate_mode = i end)
     end,
 
-    div("Free · Transpose"),
+    div(L.label.." · Levels"),
     function()
-      params:add_number("free_transpose_oct", "free play transpose (oct)", -4, 4, S.free.transpose_oct)
-      params:set_action("free_transpose_oct", function(v) panic_all_outputs(); S.free.transpose_oct = util.clamp(v, -4, 4) end)
+      params:add_number(L.id_prefix.."_mx_vol_pct", "free mx volume (%)", 0, 200, L.mx_vol_pct)
+      params:set_action(L.id_prefix.."_mx_vol_pct", function(v) L.mx_vol_pct = util.clamp(math.floor(v or 100), 0, 200) end)
+    end,
+
+    div(L.label.." · Transpose"),
+    function()
+      params:add_number(L.id_prefix.."_transpose_oct", "transpose (oct)", -4, 4, L.transpose_oct)
+      params:set_action(L.id_prefix.."_transpose_oct", function(v) panic_all_outputs(); L.transpose_oct = util.clamp(v, -4, 4) end)
     end,
   })
 end
@@ -2266,13 +2300,19 @@ function init()
   add_io_section(default_midi_in_index)
   add_setup_section()
   add_timing_section()
-  add_free_section()
+
+  -- Free A section (defaults: IN ch=2, OUT ch=1)
+  add_free_lane_section(S.freeA, { in_ch = 2, out_ch = 1 })
+  -- Free B section (defaults: IN ch=3, OUT ch=1)
+  add_free_lane_section(S.freeB, { in_ch = 3, out_ch = 1 })
+
   add_arp_section()
 
   midi.add = function(dev)
     print("MIDI added: "..(dev.name or "?"))
     rebuild_midi_lists()
-    Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
+    Free.setup_midi_out(S.freeA, params:get(S.freeA.midi_out_dev_param) or 1)
+    Free.setup_midi_out(S.freeB, params:get(S.freeB.midi_out_dev_param) or 1)
     Arp.hotplug_refresh()
   end
   midi.remove = function(dev)
@@ -2280,7 +2320,8 @@ function init()
     rebuild_midi_lists()
     setup_midi_in(params:get(S.midi.in_dev_param) or default_midi_in_index)
     MIDI.setup_out(params:get(S.midi.out_dev_param) or 1)
-    Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
+    Free.setup_midi_out(S.freeA, params:get(S.freeA.midi_out_dev_param) or 1)
+    Free.setup_midi_out(S.freeB, params:get(S.freeB.midi_out_dev_param) or 1)
     Arp.hotplug_refresh()
   end
 
@@ -2288,9 +2329,13 @@ function init()
   show_param("chorder_vel_fixed", S.velocity_mode == 1)
   show_param("chorder_inversion", S.voicing ~= 11)
   show_param(S.midi.gate_param, want_midi())
-  show_param("free_vel_fixed", S.free.velocity_mode == 1)
-  show_param("free_gate_mode", true)
-  update_free_visibility()
+
+  -- visibility for both lanes
+  for _,L in ipairs({S.freeA, S.freeB}) do
+    show_param(L.id_prefix.."_vel_fixed", L.velocity_mode == 1)
+    show_param(L.id_prefix.."_gate_mode", true)
+    update_free_visibility(L)
+  end
   update_arp_basics_visibility()
 
   recompute_root_midi()
@@ -2298,7 +2343,8 @@ function init()
 
   MX.ensure_loaded(S.voice_index)
   MIDI.setup_out(1)
-  Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
+  Free.setup_midi_out(S.freeA, params:get(S.freeA.midi_out_dev_param) or 1)
+  Free.setup_midi_out(S.freeB, params:get(S.freeB.midi_out_dev_param) or 1)
   Arp.hotplug_refresh()
   setup_midi_in(params:get(S.midi.in_dev_param) or default_midi_in_index)
   rebind_midi_in_if_needed()
@@ -2308,7 +2354,7 @@ end
 -- ===== input handlers =====
 function key(n, z)
   if n == 2 and z == 1 then
-    S.page = (S.page % 4) + 1
+    S.page = (S.page % 5) + 1
     redraw()
   elseif n == 3 and z == 1 then
     -- K3: panic
@@ -2318,7 +2364,7 @@ end
 
 function enc(n, d)
   if n == 1 then
-    S.page = util.clamp(S.page + (d>0 and 1 or (d<0 and -1 or 0)), 1, 4)
+    S.page = util.clamp(S.page + (d>0 and 1 or (d<0 and -1 or 0)), 1, 5)
     redraw()
     return
   end
@@ -2326,8 +2372,10 @@ function enc(n, d)
   local items, cur_ref
   if S.page == S.PAGE_MAIN_IO then
     items, cur_ref = items_main_io(), "MAIN"
-  elseif S.page == S.PAGE_FREE_IO then
-    items, cur_ref = items_free_io(), "FREE"
+  elseif S.page == S.PAGE_FREEA_IO then
+    items, cur_ref = items_free_io(S.freeA), "FREEA"
+  elseif S.page == S.PAGE_FREEB_IO then
+    items, cur_ref = items_free_io(S.freeB), "FREEB"
   elseif S.page == S.PAGE_ARP then
     items, cur_ref = items_arp_io(), "ARP"
   else
