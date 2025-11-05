@@ -226,6 +226,11 @@ local function mod_effective_build()
   return eff_chord_type, eff_sus_mode, eff_add_bass, eff_mono
 end
 
+-- ===== forward declarations for upvalues used by closures =====
+local rebind_midi_in_if_needed -- make visible to Arp & UI closures
+local show_param               -- make visible to UI closures
+local setup_midi_in            -- make visible to UI closures
+
 -- ===== MX module =====
 local MX = (function()
   local function exists(path) local f=io.open(path,"r"); if f then f:close(); return true end; return false end
@@ -577,6 +582,8 @@ local Arp = (function()
     if A.mout then A.mout.event = nil; A.mout = nil end
     A.mout = midi.connect(real_port)
     if A.mout then print("ARP MIDI OUT: "..(midi.vports[real_port].name or ("port "..real_port))) end
+    -- keep chord/free + input alive after ARP port changes
+    if rebind_midi_in_if_needed then rebind_midi_in_if_needed() end
   end
 
   local function fanout_on(note, vel)
@@ -778,6 +785,7 @@ local Arp = (function()
     A.step_i = A.step_i + 1
   end
 
+  private = {}
   local function run()
     A.running = true
     A.step_i  = 1
@@ -820,6 +828,8 @@ local Arp = (function()
   local function hotplug_refresh()
     local sel = params:get("arp_midi_out_dev") or 1
     setup_midi_out(sel)
+    -- ensure chord/free MIDI + input remain bound after ARP out-mode toggles
+    if rebind_midi_in_if_needed then rebind_midi_in_if_needed() end
   end
 
   local function set_genre_idx(i)
@@ -879,6 +889,7 @@ local Free = (function()
     else
       print("FREE MIDI OUT: connect failed for port "..real_port)
     end
+    if rebind_midi_in_if_needed then rebind_midi_in_if_needed() end
   end
 
   local function free_note_on_mx(canon, note, vel) MX.on_free(canon, note, free_scaled_vel(vel)) end
@@ -1624,7 +1635,7 @@ local function teardown_midi_in()
   if S.midi.input then S.midi.input.event = nil; S.midi.input = nil end
 end
 
-local function setup_midi_in(param_index)
+setup_midi_in = function(param_index)
   teardown_midi_in()
   local port = S.midi.in_ports_map[param_index] or 0
   if port == 0 then
@@ -1699,7 +1710,7 @@ local function setup_midi_in(param_index)
   print("MIDI IN: connected to "..(S.midi.in_devices[param_index] or ("port "..port)))
 end
 
-local function rebind_midi_in_if_needed()
+rebind_midi_in_if_needed = function()
   if (S.midi.input == nil) or (S.midi.input.event == nil) then
     local cur = params:get(S.midi.in_dev_param) or 1
     setup_midi_in(cur)
@@ -1750,7 +1761,11 @@ local function rebuild_midi_lists()
 end
 
 -- ===== lifecycle utils =====
-local function show_param(id, show) local p=params:lookup_param(id); if not p then return end; if show then params:show(id) else params:hide(id) end end
+show_param = function(id, show)
+  local p=params:lookup_param(id)
+  if not p then return end
+  if show then params:show(id) else params:hide(id) end
+end
 
 local function update_free_visibility()
   local chroma = (S.free.key_mode == 3)
@@ -1822,7 +1837,7 @@ local function add_io_section(default_midi_in_index)
     end,
     function()
       local ch_opts_in = {"omni"}; for i=1,16 do ch_opts_in[#ch_opts_in+1]=tostring(i) end
-      params:add_option(S.midi.in_ch_param, "chord MIDI input ch", ch_opts_in, 1)
+      params:add_option(S.midi.in_ch_param, "chord MIDI input ch", ch_opts_in, 2)
     end,
 
     div("I/O · Instruments (Chord)"),
