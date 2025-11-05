@@ -18,7 +18,10 @@ local DEFAULT_MIDI_OUT_PORT = 1
 -- ===== consolidated state =====
 local S = {
   -- UI pages
-  PAGE_OUTPUT = 1, PAGE_CHORD = 2, page = 1,
+  PAGE_MAIN_IO = 1, PAGE_FREE_IO = 2, PAGE_ARP = 3, PAGE_CHORD = 4, page = 1,
+
+  -- cursors (for E2 select / E3 edit UI)
+  cursor = { MAIN=1, FREE=1, ARP=1, CHORD=1 },
 
   -- root / scale
   root_pc = 0, root_oct = 1, root_midi = 24, scale_name = "Major",
@@ -611,6 +614,7 @@ local Arp = (function()
     table.sort(out); return out
   end
 
+  private = {}
   local function make_material()
     local base_notes = {}
     if type(S.last_voiced_notes)=="table" and #S.last_voiced_notes>0 then
@@ -751,6 +755,7 @@ local Arp = (function()
     return util.clamp(base + o*12 + tr, 0, 127)
   end
 
+  private = {}
   local function step_once_legacy()
     all_off()
     if not A.running then return end
@@ -850,8 +855,8 @@ local Arp = (function()
 
   local function set_enable(v) A.pat_enable = (v==2); if A.pat_enable then select_pattern() end end
   local function set_genre_idx(i) local g = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()[i] or "Pop"; A.pat_genre = g; A.cur_pat=nil; select_pattern() end
-  local function set_pat_idx(i) A.pat_index = i or 1; A.cur_pat=nil; select_pattern() end
   private = {}
+  local function set_pat_idx(i) A.pat_index = i or 1; A.cur_pat=nil; select_pattern() end
   local function set_rand(v) A.pat_random_on_chord = (v==2) end
 
   return {
@@ -1285,13 +1290,13 @@ local function free_handle_note_off(in_note)
   end
 end
 
--- ===== UI =====
+-- ===== UI helpers =====
 local function draw_header(active_label)
   screen.level(15); screen.move(4, 12); screen.text("CHORDER")
   screen.level(10); screen.move(124, 12); if active_label then screen.text_right("["..active_label.."]") end
 end
 local function draw_line(y, label, value)
-  screen.level(12); screen.move(4, y); screen.text(label or "")
+  screen.level(12); screen.move(10, y); screen.text(label or "")
   screen.level(15); screen.move(124, y); screen.text_right(value or "")
 end
 local function key_center_string()
@@ -1299,58 +1304,261 @@ local function key_center_string()
   return string.format("%s (root %s%d)", name, rname, roct)
 end
 
-local function draw_output_page()
-  draw_header("I/O")
-  local out_mode_full  = OUT_OPTS[params:get(S.out_mode_param) or 1] or "?"
-  local out_mode_short = short_mode_name(out_mode_full)
-  local out_idx  = params:get(S.midi.out_dev_param) or 1
-  local out_lbl  = ellipsize(S.midi.devices[out_idx] or "—", 12)
-  local mo_ch    = tostring(params:get(S.midi.out_ch_param) or 1)
-  local mi_i      = params:get(S.midi.in_dev_param) or 1
-  local mi_lbl    = ellipsize(S.midi.in_devices[mi_i] or "none", 12)
-  local ch_in_idx = params:get(S.midi.in_ch_param) or 1
-  local ch_in_disp = (ch_in_idx==1) and "Omni" or ("Ch"..tostring(ch_in_idx-1))
-  local free_on        = (params:get("free_enable")==2)
-  local free_mode_full = S.free.out_opts[params:get(S.free.out_mode_param) or 1] or "?"
-  local free_mode_short = short_mode_name(free_mode_full)
-  local free_dev_i     = params:get(S.free.midi_out_dev_param) or 1
-  local free_dev       = ellipsize(S.midi.devices[free_dev_i] or "—", 12)
-  local free_ch        = tostring(params:get(S.free.midi_out_ch_param) or 1)
-  local free_in_ch     = tostring(params:get(S.free.midi_in_ch_param) or 2)
+-- extra UI helpers for selector/editor mode
+local function caret_at(line_y, selected)  -- draw '>' for selection
+  if selected then
+    screen.level(15); screen.move(2, line_y); screen.text(">")
+  end
+end
+local function clamp_cursor(cur, n)
+  return util.clamp(cur or 1, 1, math.max(1, n or 1))
+end
+local function short_mode_from_param(id, opts_tbl)
+  local full = opts_tbl[(params:get(id) or 1)] or "?"
+  return short_mode_name(full)
+end
+local function current_midi_out_label(idx)
+  return ellipsize(S.midi.devices[idx or (params:get(S.midi.out_dev_param) or 1)] or "—", 16)
+end
+local function current_midi_in_label()
+  local i = params:get(S.midi.in_dev_param) or 1
+  return ellipsize(S.midi.in_devices[i] or "none", 16)
+end
+local function channel_disp(idx) return (idx==1) and "Omni" or ("Ch"..tostring((idx or 2)-1)) end
 
-  screen.level(12); screen.move(4, 22); screen.text("Out:")
-  screen.level(15); screen.move(124,22)
-  if out_mode_short == "MIDI" or out_mode_short == "mx+M" then
-    screen.text_right(out_mode_short.." | "..out_lbl.." / Ch"..mo_ch)
-  else
-    screen.text_right(out_mode_short)
+-- ===== Page items (focus/edit model) =====
+
+local function items_main_io()
+  local items = {}
+
+  -- In (Chord input & ch)
+  table.insert(items, {
+    label = "In",
+    value_str = function()
+      local in_lbl = current_midi_in_label()
+      local in_chi = params:get(S.midi.in_ch_param) or 1
+      return in_lbl.." / "..channel_disp(in_chi)
+    end,
+    delta = function(d)
+      if math.abs(d) == 1 then
+        params:delta(S.midi.in_dev_param, d)
+        setup_midi_in(params:get(S.midi.in_dev_param) or 1)
+      else
+        params:delta(S.midi.in_ch_param, d > 0 and 1 or -1)
+      end
+    end
+  })
+
+  -- Out mode
+  table.insert(items, {
+    label = "Out",
+    value_str = function()
+      return short_mode_from_param(S.out_mode_param, OUT_OPTS)
+    end,
+    delta = function(d) params:delta(S.out_mode_param, d) end
+  })
+
+  -- If mx, show mx.samples voice; else if MIDI present show MIDI device
+  do
+    local out_short = short_mode_from_param(S.out_mode_param, OUT_OPTS)
+    if out_short == "mx" or out_short == "mx+M" then
+      table.insert(items, {
+        label = "mx.samples",
+        value_str = function()
+          return ellipsize(S.display_names[params:get("chorder_mx_voice") or S.voice_index] or "(no packs)", 20)
+        end,
+        delta = function(d) params:delta("chorder_mx_voice", d) end
+      })
+    end
+    if out_short == "MIDI" or out_short == "mx+M" then
+      table.insert(items, {
+        label = "MIDI Out",
+        value_str = function()
+          local dev = current_midi_out_label(params:get(S.midi.out_dev_param))
+          local ch  = tostring(params:get(S.midi.out_ch_param) or 1)
+          return dev.." / Ch"..ch
+        end,
+        delta = function(d)
+          if math.abs(d) == 1 then params:delta(S.midi.out_dev_param, d)
+          else params:delta(S.midi.out_ch_param, d > 0 and 1 or -1) end
+        end
+      })
+    end
   end
 
-  screen.level(12); screen.move(4, 34); screen.text("In:")
-  screen.level(15); screen.move(124,34); screen.text_right(mi_lbl.." / "..ch_in_disp)
+  return items
+end
 
-  screen.level(12); screen.move(4, 46); screen.text("Free:")
-  screen.level(15); screen.move(124,46)
-  if free_on then screen.text_right("on | "..free_mode_short.." | InCh "..free_in_ch)
-  else screen.text_right("off") end
+local function items_free_io()
+  local items = {}
 
-  if want_mx() then
-    local cur_name = S.display_names[S.voice_index] or "(no packs)"
-    screen.level(12); screen.move(4, 58); screen.text("mx.samples:")
-    screen.level(15); screen.move(124,58); screen.text_right(ellipsize(cur_name, 18))
-  elseif free_on and (free_mode_short == "MIDI" or free_mode_short == "mx+M") then
-    screen.level(12); screen.move(4, 58); screen.text("Free MIDI:")
-    screen.level(15); screen.move(124,58); screen.text_right(free_dev.." / Ch"..free_ch)
-  else
-    local bpm = string.format("%d BPM", math.floor(clock.get_tempo() or 120))
-    screen.level(10); screen.move(4, 58); screen.text(bpm)
+  -- Toggle
+  table.insert(items, {
+    label = "Free",
+    value_str = function() return (params:get("free_enable")==2) and "on" or "off" end,
+    delta = function(d) params:delta("free_enable", d) end
+  })
+
+  -- In (channel only)
+  table.insert(items, {
+    label = "In Ch",
+    value_str = function() return tostring(params:get(S.free.midi_in_ch_param) or 2) end,
+    delta = function(d) params:delta(S.free.midi_in_ch_param, d > 0 and 1 or -1) end
+  })
+  -- Out mode
+  table.insert(items, {
+    label = "Out",
+    value_str = function()
+      return short_mode_from_param(S.free.out_mode_param, S.free.out_opts)
+    end,
+    delta = function(d) params:delta(S.free.out_mode_param, d) end
+  })
+
+  -- If mx, voice; if MIDI present, device/ch
+  do
+    local out_short = short_mode_from_param(S.free.out_mode_param, S.free.out_opts)
+    if out_short == "mx" or out_short == "mx+M" then
+      table.insert(items, {
+        label = "mx.samples",
+        value_str = function()
+          return ellipsize(S.display_names[params:get("free_mx_voice") or S.free.voice_index] or "(no packs)", 20)
+        end,
+        delta = function(d) params:delta("free_mx_voice", d) end
+      })
+    end
+    if out_short == "MIDI" or out_short == "mx+M" then
+      table.insert(items, {
+        label = "MIDI Out",
+        value_str = function()
+          local dev = current_midi_out_label(params:get(S.free.midi_out_dev_param))
+          local ch  = tostring(params:get(S.free.midi_out_ch_param) or 1)
+          return dev.." / Ch"..ch
+        end,
+        delta = function(d)
+          if math.abs(d) == 1 then
+            params:delta(S.free.midi_out_dev_param, d)
+            Free.setup_midi_out(params:get(S.free.midi_out_dev_param) or 1)
+          else
+            params:delta(S.free.midi_out_ch_param, d > 0 and 1 or -1)
+          end
+        end
+      })
+    end
   end
+
+  return items
+end
+
+local function items_arp_io()
+  local items = {}
+
+  -- Toggle
+  table.insert(items, {
+    label = "Arp",
+    value_str = function() return (params:get("arp_enable")==2) and "on" or "off" end,
+    delta = function(d) params:delta("arp_enable", d) end
+  })
+
+  -- Out mode
+  table.insert(items, {
+    label = "Out",
+    value_str = function()
+      local out_opts = {"mx.samples","mx.samples + MIDI","MIDI"}
+      local full = out_opts[params:get("arp_out_mode") or 1] or "?"
+      return short_mode_name(full)
+    end,
+    delta = function(d) params:delta("arp_out_mode", d) end
+  })
+
+  -- If mx, voice; if MIDI present, device/ch
+  do
+    local out_opts = {"mx.samples","mx.samples + MIDI","MIDI"}
+    local full = out_opts[params:get("arp_out_mode") or 1] or "?"
+    local out_short = short_mode_name(full)
+    if out_short == "mx" or out_short == "mx+M" then
+      table.insert(items, {
+        label = "mx.samples",
+        value_str = function()
+          return ellipsize(S.display_names[params:get("arp_mx_voice") or 1] or "(no packs)", 20)
+        end,
+        delta = function(d) params:delta("arp_mx_voice", d) end
+      })
+    end
+    if out_short == "MIDI" or out_short == "mx+M" then
+      table.insert(items, {
+        label = "MIDI Out",
+        value_str = function()
+          local dev = current_midi_out_label(params:get("arp_midi_out_dev"))
+          local ch  = tostring(params:get("arp_midi_out_ch") or 1)
+          return dev.." / Ch"..ch
+        end,
+        delta = function(d)
+          if math.abs(d) == 1 then
+            params:delta("arp_midi_out_dev", d)
+            Arp.setup_midi_out(params:get("arp_midi_out_dev") or 1)
+          else
+            params:delta("arp_midi_out_ch", d > 0 and 1 or -1)
+          end
+        end
+      })
+    end
+  end
+
+  return items
+end
+
+local function items_chord_page()
+  return {
+    {
+      label="Key",
+      value_str=function() return key_center_string() end,
+      delta=function(d) params:delta("chorder_root_pc", d) end
+    },
+    {
+      label="Scale",
+      value_str=function() return S.scale_name end,
+      delta=function(d) params:delta("chorder_scale", d) end
+    },
+  }
+end
+
+-- ===== Page draw with items =====
+local function draw_items_list(y_start, items, cursor_idx)
+  local y = y_start
+  for i, it in ipairs(items) do
+    local selected = (i == cursor_idx)
+    caret_at(y, selected)
+    draw_line(y, it.label..":", it.value_str and it.value_str() or "")
+    y = y + 10
+  end
+end
+
+local function draw_main_io_page()
+  draw_header("Main Chord I/O")
+  local items = items_main_io()
+  S.cursor.MAIN = clamp_cursor(S.cursor.MAIN, #items)
+  draw_items_list(24, items, S.cursor.MAIN)
+end
+
+local function draw_free_io_page()
+  draw_header("Free Play I/O")
+  local items = items_free_io()
+  S.cursor.FREE = clamp_cursor(S.cursor.FREE, #items)
+  draw_items_list(24, items, S.cursor.FREE)
+end
+
+local function draw_arp_io_page()
+  draw_header("Arp I/O")
+  local items = items_arp_io()
+  S.cursor.ARP = clamp_cursor(S.cursor.ARP, #items)
+  draw_items_list(24, items, S.cursor.ARP)
 end
 
 local function draw_chord_page()
   draw_header("Chord")
-  draw_line(28, "Key:", key_center_string())
-  draw_line(40, "Scale:", S.scale_name)
+  local items = items_chord_page()
+  S.cursor.CHORD = clamp_cursor(S.cursor.CHORD, #items)
+  draw_items_list(24, items, S.cursor.CHORD)
 
   -- show armed modifier hint on chord page
   if S.mod.active and S.mod.hint ~= "" then
@@ -1359,17 +1567,17 @@ local function draw_chord_page()
 
   local now_t = now()
   local show_name = S.last_chord_name and ((now_t - S.last_name_time) < S.last_name_timeout)
-  screen.level(15)
-  if show_name then
-    screen.move(64, 58); screen.text_center(ellipsize(S.last_chord_name, 26))
-  else
-    screen.level(10); screen.move(64, 58); screen.text_center("(play a chord)")
-  end
+  screen.level(show_name and 15 or 10)
+  screen.move(64, 60); screen.text_center(show_name and ellipsize(S.last_chord_name, 26) or "(play a chord)")
 end
 
 function redraw()
   screen.clear()
-  if S.page == S.PAGE_OUTPUT then draw_output_page() else draw_chord_page() end
+  if     S.page == S.PAGE_MAIN_IO then draw_main_io_page()
+  elseif S.page == S.PAGE_FREE_IO then draw_free_io_page()
+  elseif S.page == S.PAGE_ARP     then draw_arp_io_page()
+  else                                 draw_chord_page()      -- PAGE_CHORD
+  end
   screen.update()
 end
 
@@ -2067,7 +2275,7 @@ end
 -- ===== input handlers =====
 function key(n, z)
   if n == 2 and z == 1 then
-    S.page = (S.page == S.PAGE_OUTPUT) and S.PAGE_CHORD or S.PAGE_OUTPUT
+    S.page = (S.page % 4) + 1
     redraw()
   elseif n == 3 and z == 1 then
     -- K3: panic
@@ -2076,23 +2284,40 @@ function key(n, z)
 end
 
 function enc(n, d)
+  -- E1: page nav
   if n == 1 then
-    S.page = (S.page == S.PAGE_OUTPUT) and S.PAGE_CHORD or S.PAGE_OUTPUT
+    S.page = util.clamp(S.page + (d>0 and 1 or (d<0 and -1 or 0)), 1, 4)
     redraw()
     return
   end
 
-  if S.page == S.PAGE_OUTPUT then
-    if n == 2 then params:delta(S.out_mode_param, d)
-    elseif n == 3 then
-      if want_mx() then params:delta("chorder_mx_voice", d) else params:delta(S.midi.out_dev_param, d) end
-    end
+  -- E2: move cursor; E3: edit selected
+  local items, cur_ref
+  if S.page == S.PAGE_MAIN_IO then
+    items, cur_ref = items_main_io(), "MAIN"
+  elseif S.page == S.PAGE_FREE_IO then
+    items, cur_ref = items_free_io(), "FREE"
+  elseif S.page == S.PAGE_ARP then
+    items, cur_ref = items_arp_io(), "ARP"
+  else
+    items, cur_ref = items_chord_page(), "CHORD"
+  end
+
+  if n == 2 then
+    -- move selection
+    local cur = clamp_cursor(S.cursor[cur_ref], #items)
+    cur = util.clamp(cur + (d>0 and 1 or -1), 1, #items)
+    S.cursor[cur_ref] = cur
+    redraw()
     return
   end
 
-  if S.page == S.PAGE_CHORD then
-    if n == 2 then params:delta("chorder_root_pc", d)
-    elseif n == 3 then params:delta("chorder_scale", d) end
+  if n == 3 then
+    -- edit selected
+    local cur = clamp_cursor(S.cursor[cur_ref], #items)
+    local it = items[cur]
+    if it and it.delta then it.delta(d) end
+    redraw()
     return
   end
 end
