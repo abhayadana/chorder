@@ -409,6 +409,7 @@ local MIDI = (function()
     return (60 / bpm) * (S.tick_div or 1/4) * frac
   end
 
+  private = {}
   local function schedule_gate_for_note(note)
     local secs = compute_gate_seconds()
     if not secs or secs <= 0 then return end
@@ -438,8 +439,8 @@ local function scale128()
 end
 
 -- ===== ARP PATTERN LIBRARY =====
--- Pattern step format:
--- { d=1..7, oct=-2..+2, rest=true|nil, prob=0..1, r=ratchets>=1 }
+-- Degree pattern step format: { d=1..7, oct=-2..+2, rest=true|nil, prob=0..1, r=ratchets>=1 }
+-- Basics (legacy-order) patterns: carry markers: { basics=true, use_order=true } or { basics=true, legacy="<name>" }
 local PatternLib = (function()
   local function deg(d, oct, prob, r, rest) return { d=d, oct=oct or 0, prob=prob or 1.0, r=r or 1, rest=rest or false } end
   local function clone(tbl) local t={}; for k,v in pairs(tbl) do t[k]=v end; return t end
@@ -522,6 +523,25 @@ local PatternLib = (function()
     }
   }
 
+  -- === Basics (folded legacy "orders") =======================
+  -- We provide a "use arp_order" item which defers to the arp_order param,
+  -- plus fixed variants that map to specific Strum orders.
+  local function basics_patterns()
+    return {
+      { name="basics · use arp_order", basics=true, use_order=true }, -- uses params: arp_order/octaves/oct_walk
+      { name="basics · up",            basics=true, legacy="up" },
+      { name="basics · down",          basics=true, legacy="down" },
+      { name="basics · up/down",       basics=true, legacy="up/down" },
+      { name="basics · down/up",       basics=true, legacy="down/up" },
+      { name="basics · random",        basics=true, legacy="random" },
+      { name="basics · center-out",    basics=true, legacy="center-out" },
+      { name="basics · outside-in",    basics=true, legacy="outside-in" },
+      -- extra variants requested
+      { name="basics · random no-repeat first", basics=true, legacy="random no-repeat first" },
+      { name="basics · random stable ends",     basics=true, legacy="random stable ends" },
+    }
+  end
+
   local function expand()
     local lib = {}
     for g,src in pairs(seeds) do
@@ -540,6 +560,9 @@ local PatternLib = (function()
           steps={deg(1,o),deg(2,o),deg(3,o),deg(4,o),deg(5,o),deg(6,o),deg(5,o),deg(4,o)} })
       end
     end
+
+    lib["Basics"] = basics_patterns()
+
     return lib
   end
 
@@ -563,9 +586,8 @@ local Arp = (function()
     coro = nil,
     mout = nil, -- dedicated MIDI out (no sentinel)
 
-    -- pattern system
-    pat_enable = false,
-    pat_genre = "Pop",
+    -- pattern system (always ON)
+    pat_genre = "Basics",
     pat_index = 1,
     pat_random_on_chord = false,
     cur_pat = nil,
@@ -639,12 +661,60 @@ local Arp = (function()
     A.notes_buf = buf
   end
 
-  local function build_order()
-    local stype = S.arp_order_idx or 1
-    return select(1, Strum.make(#A.notes_buf, stype, A.ord_state)) or {}
+  -- map names for Basics fixed variants -> Strum indices
+  local LEGACY_TO_STRUM_IDX = {
+    ["up"]                      = 1,
+    ["down"]                    = 2,
+    ["up/down"]                 = 3,
+    ["down/up"]                 = 4,
+    ["random"]                  = 5,
+    ["center-out"]              = 6,
+    ["outside-in"]              = 7,
+    ["random no-repeat first"]  = 10,
+    ["random stable ends"]      = 11,
+  }
+
+  local function basics_next_note(step_i)
+    -- ensure material exists
+    if not A.notes_buf or #A.notes_buf == 0 then make_material() end
+    if not A.notes_buf or #A.notes_buf == 0 then return nil end
+
+    -- choose order
+    local stype
+    if A.cur_pat and A.cur_pat.use_order then
+      stype = params:get("arp_order") or 1
+    else
+      local ord_name = (A.cur_pat and A.cur_pat.legacy) or "up"
+      stype = LEGACY_TO_STRUM_IDX[ord_name] or 1
+    end
+
+    local ord = select(1, Strum.make(#A.notes_buf, stype, A.ord_state)) or {}
+    if #ord == 0 then return nil end
+
+    local idx = ord[((step_i-1) % #ord) + 1]
+    local base = A.notes_buf[idx]
+
+    -- octave travel (globals, apply to Basics only)
+    local span = params:get("arp_octaves") or 1
+    local walk = params:get("arp_oct_walk") or 1 -- 1=wrap, 2=bounce
+    local t = math.floor((step_i-1)/#ord)
+    local o
+    if span <= 0 then
+      o = 0
+    else
+      if walk == 2 then
+        local period = span*2
+        local p = (period==0) and 0 or (t % period)
+        o = (p <= span) and p or (period - p)
+      else
+        o = t % (span+1)
+      end
+    end
+
+    local tr = (params:get("arp_transpose_oct") or 0) * 12
+    return util.clamp(base + o*12 + tr, 0, 127)
   end
 
-  -- pattern helpers
   local function degree_to_midi(deg, oct_off)
     local sc = scale128()
     if not sc or #sc==0 then return nil end
@@ -663,8 +733,8 @@ local Arp = (function()
 
   private = {}
   local function select_pattern()
-    if not A.pat_enable then A.cur_pat=nil; return end
-    local pat = (A.pat_random_on_chord and PatternLib.RAND(A.pat_genre)) or PatternLib.GET(A.pat_genre, A.pat_index)
+    local pat = (params:get("arp_pat_random_on_chord")==2 and PatternLib.RAND(A.pat_genre))
+                 or PatternLib.GET(A.pat_genre, A.pat_index)
     A.cur_pat = pat
     if pat then print("ARP pattern: "..(pat.name or "(unnamed)")) end
   end
@@ -685,92 +755,41 @@ local Arp = (function()
 
   local function step_once_pattern()
     all_off()
-    if not A.running or not A.cur_pat or not S.last_voiced_notes then return end
-    local steps = A.cur_pat.steps or {}
-    if #steps==0 then return end
-    local idx = ((A.step_i-1) % #steps) + 1
-    local st = steps[idx] or {}
+    if not A.running or not A.cur_pat then return end
+
     local wait = step_seconds()
-
     local gprob = (params:get("arp_step_prob") or 100) / 100
-    local prob = (st.prob or 1.0) * gprob
-    local is_rest = st.rest or (math.random() > prob)
 
-    if not is_rest and st.d then
-      local n = degree_to_midi(util.clamp(st.d,1,7), st.oct or 0)
-      if n then
-        local gm = params:get("arp_gate") or 1
-        local frac = (gm==2 and 0.25) or (gm==3 and 0.50) or (gm==4 and 0.75) or 1.0
-        local vel_base = util.clamp((params:get("arp_vel") or 100) + (A.step_i-1)*(params:get("arp_vel_ramp") or 0), 1, 127)
-        local hsteps = params:get("arp_hum_steps") or 0
-        local hvel   = params:get("arp_hum_vel") or 0
-        local pre = 0
-        if hsteps > 0 then
-          local sub = math.random(0, hsteps)
-          pre = (sub / 8) * wait
-        end
-        local vel2 = util.clamp(vel_base + math.random(-hvel, hvel), 1, 127)
-
-        local rpat = st.r or 1
-        local rglob = params:get("arp_step_ratchet") or 1
-        local rat_total = math.max(1, math.floor(rpat * rglob))
-        private = {}
-        local rat_prob = (params:get("arp_ratchet_prob") or 100) / 100
-        local sub_wait = wait / rat_total
-        local sub_dur  = sub_wait * frac
-
-        clock.run(function()
-          if pre > 0 then clock.sleep(pre) end
-          for j=1, rat_total do
-            if j == 1 or math.random() <= rat_prob then
-              play_note_with_gate(n, vel2, sub_dur)
-            end
-            if j < rat_total then clock.sleep(sub_wait) end
-          end
-        end)
+    -- resolve target note (Basics vs Degree)
+    local n = nil
+    if A.cur_pat.basics then
+      -- recompute material when needed
+      if (params:get("arp_retrack")==2) then
+        local ord = select(1, Strum.make(math.max(#A.notes_buf,1), (params:get("arp_order") or 1), A.ord_state)) or {}
+        if (#A.notes_buf > 0) and ((A.step_i-1) % math.max(#ord,1) == 0) then make_material() end
       end
-    end
-    A.step_i = A.step_i + 1
-  end
-
-  local function next_note_legacy(step_idx)
-    local ord = build_order(); if #ord==0 then return nil end
-    local idx = ord[((step_idx-1) % #ord) + 1]
-    local base = A.notes_buf[idx]
-    local span = params:get("arp_octaves") or 1
-    local walk = params:get("arp_oct_walk") or 1 -- 1=wrap, 2=bounce
-    local t = math.floor((step_idx-1)/#ord)
-    local o
-    if span<=0 then o=0
+      -- step probability (Basics obey global only)
+      if math.random() <= gprob then
+        n = basics_next_note(A.step_i)
+      end
     else
-      if walk==2 then
-        local period = span*2
-        local p = (period==0) and 0 or (t % period)
-        o = (p<=span) and p or (period - p)
-      else
-        o = t % (span+1) -- wrap
+      -- Degree pattern
+      local steps = A.cur_pat.steps or {}
+      if #steps > 0 then
+        local idx = ((A.step_i-1) % #steps) + 1
+        local st = steps[idx] or {}
+        local prob = (st.prob or 1.0) * gprob
+        local is_rest = st.rest or (math.random() > prob)
+        if not is_rest and st.d then
+          n = degree_to_midi(util.clamp(st.d,1,7), st.oct or 0)
+        end
       end
     end
-    local tr = (params:get("arp_transpose_oct") or 0) * 12
-    return util.clamp(base + o*12 + tr, 0, 127)
-  end
 
-  private = {}
-  local function step_once_legacy()
-    all_off()
-    if not A.running then return end
-    local wait = step_seconds()
-
-    local gprob = (params:get("arp_step_prob") or 100) / 100
-    if math.random() > gprob then
-      A.step_i = A.step_i + 1
-      return
-    end
-
-    local n = next_note_legacy(A.step_i)
     if n then
       local gm = params:get("arp_gate") or 1
       local frac = (gm==2 and 0.25) or (gm==3 and 0.50) or (gm==4 and 0.75) or 1.0
+      local vel_base = util.clamp((params:get("arp_vel") or 100) + (A.step_i-1)*(params:get("arp_vel_ramp") or 0), 1, 127)
       local hsteps = params:get("arp_hum_steps") or 0
       local hvel   = params:get("arp_hum_vel") or 0
       local pre = 0
@@ -778,13 +797,13 @@ local Arp = (function()
         local sub = math.random(0, hsteps)
         pre = (sub / 8) * wait
       end
-      local vel_base = util.clamp((params:get("arp_vel") or 100) + (A.step_i-1)*(params:get("arp_vel_ramp") or 0), 1, 127)
       local vel2 = util.clamp(vel_base + math.random(-hvel, hvel), 1, 127)
 
-      local rat_total = math.max(1, math.floor(params:get("arp_step_ratchet") or 1))
-      local rat_prob  = (params:get("arp_ratchet_prob") or 100) / 100
-      local sub_wait  = wait / rat_total
-      local sub_dur   = sub_wait * frac
+      local rglob = params:get("arp_step_ratchet") or 1
+      local rat_total = math.max(1, math.floor(rglob))
+      local rat_prob = (params:get("arp_ratchet_prob") or 100) / 100
+      local sub_wait = wait / rat_total
+      local sub_dur  = sub_wait * frac
 
       clock.run(function()
         if pre > 0 then clock.sleep(pre) end
@@ -796,31 +815,26 @@ local Arp = (function()
         end
       end)
     end
+
     A.step_i = A.step_i + 1
   end
 
   local function run()
     A.running = true
     A.step_i  = 1
-    if A.pat_enable then
-      while A.running do
-        local wait = step_seconds()
-        if A.has_chord then
-          if not A.cur_pat then select_pattern() end
-          step_once_pattern()
+    while A.running do
+      local wait = step_seconds()
+      local freerun = (params:get("arp_free_run") or 1) == 2
+      -- If free-run is ON, run even without a fresh chord; otherwise run only while a chord is active
+      if freerun or A.has_chord then
+        if not A.cur_pat then select_pattern() end
+        -- Ensure material when Basics selected
+        if A.cur_pat and A.cur_pat.basics then
+          if #A.notes_buf == 0 then make_material() end
         end
-        clock.sleep(wait)
+        step_once_pattern()
       end
-    else
-      make_material()
-      while A.running do
-        local wait = step_seconds()
-        step_once_legacy()
-        clock.sleep(wait)
-        if params:get("arp_retrack")==2 and ((A.step_i-1) % math.max(#A.notes_buf,1) == 0) then
-          make_material()
-        end
-      end
+      clock.sleep(wait)
     end
   end
 
@@ -839,12 +853,11 @@ local Arp = (function()
   local function chord_key(down)
     if down then
       A.has_chord = true
-      if A.pat_enable then select_pattern() end
+      select_pattern()
       A.step_i = 1
-      -- arpeggio clocks independently; run() handles timing
     else
-      local mode = params:get("arp_trigger_mode") or 1 -- 1=key-held, 2=latch
-      if mode==1 then stop() end
+      -- in key-held mode, stop is gated by UI; free-run ignores has_chord
+      A.has_chord = false
     end
   end
 
@@ -853,8 +866,13 @@ local Arp = (function()
     setup_midi_out(sel)
   end
 
-  local function set_enable(v) A.pat_enable = (v==2); if A.pat_enable then select_pattern() end end
-  local function set_genre_idx(i) local g = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()[i] or "Pop"; A.pat_genre = g; A.cur_pat=nil; select_pattern() end
+  local function set_genre_idx(i)
+    local genres = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()
+    local g = genres[i] or "Basics"
+    A.pat_genre = g
+    A.cur_pat=nil
+    select_pattern()
+  end
   private = {}
   local function set_pat_idx(i) A.pat_index = i or 1; A.cur_pat=nil; select_pattern() end
   local function set_rand(v) A.pat_random_on_chord = (v==2) end
@@ -862,7 +880,7 @@ local Arp = (function()
   return {
     start=start, stop=stop, refresh=make_material, chord_key=chord_key,
     setup_midi_out=setup_midi_out, hotplug_refresh=hotplug_refresh,
-    set_pat_enable=set_enable, set_genre=set_genre_idx, set_pat=set_pat_idx, set_rand=set_rand
+    set_genre=set_genre_idx, set_pat=set_pat_idx, set_rand=set_rand
   }
 end)()
 
@@ -927,6 +945,7 @@ local Free = (function()
     if free_want_mx()   then free_note_on_mx(canon, note, vel) end
     if free_want_midi() then free_note_on_midi(note, vel) end
   end
+  private = {}
   local function free_fanout_off(canon, note)
     if free_want_mx()   then free_note_off_mx(canon, note) end
     if free_want_midi() then free_note_off_midi(note) end
@@ -970,6 +989,7 @@ local Free = (function()
     return chordlib.quantize_to_scale(sc, note)
   end
 
+  private = {}
   local function free_make_strum_order(count)
     local tmp_state = { alt_flip=false, last_first=nil, last_last=nil }
     local ord = select(1, Strum.make(count, S.free.strum_type, tmp_state))
@@ -1293,7 +1313,7 @@ end
 -- ===== UI helpers =====
 local function draw_header(active_label)
   screen.level(15); screen.move(4, 12); screen.text("CHORDER")
-  screen.level(10); screen.move(124, 12); if active_label then screen.text_right("["..active_label.."]") end
+  screen.level(10); screen.move(124, 12); screen.text_right(active_label and ("["..active_label.."]") or "")
 end
 local function draw_line(y, label, value)
   screen.level(12); screen.move(10, y); screen.text(label or "")
@@ -1452,7 +1472,7 @@ end
 local function items_arp_io()
   local items = {}
 
-  -- Toggle
+  -- Always on (transport gate handled by Arp.start/stop)
   table.insert(items, {
     label = "Arp",
     value_str = function() return (params:get("arp_enable")==2) and "on" or "off" end,
@@ -1529,7 +1549,7 @@ local function draw_items_list(y_start, items, cursor_idx)
     local selected = (i == cursor_idx)
     caret_at(y, selected)
     draw_line(y, it.label..":", it.value_str and it.value_str() or "")
-    y = y + 10
+    y = y + 9
   end
 end
 
@@ -1560,7 +1580,6 @@ local function draw_chord_page()
   S.cursor.CHORD = clamp_cursor(S.cursor.CHORD, #items)
   draw_items_list(24, items, S.cursor.CHORD)
 
-  -- show armed modifier hint on chord page
   if S.mod.active and S.mod.hint ~= "" then
     screen.level(9); screen.move(64, 50); screen.text_center("mods: "..S.mod.hint)
   end
@@ -1775,6 +1794,19 @@ local function update_free_visibility()
   show_param("free_vel_fixed",           true)
   show_param("free_gate_mode",           true)
   -- dynamics & flam remain visible (safe)
+end
+
+local function update_arp_basics_visibility()
+  local pg = params:lookup_param("arp_pat_genre")
+  local is_basics = false
+  if pg and pg.options then
+    local gname = pg.options[params:get("arp_pat_genre") or 1]
+    is_basics = (gname == "Basics")
+  end
+  -- Only Basics uses these globals
+  show_param("arp_order",   is_basics)
+  show_param("arp_octaves", is_basics)
+  show_param("arp_oct_walk",is_basics)
 end
 
 -- ===== sections (using build_group) =====
@@ -2126,6 +2158,7 @@ local function add_arp_section()
     end,
     function() params:add_option("arp_trigger_mode", "trigger mode", {"key-held","latch"}, 1) end,
     function() params:add_option("arp_retrack", "retrack at cycle", {"off","on"}, 1) end,
+    function() params:add_option("arp_free_run", "free-run (ignore key-held)", {"off","on"}, 1) end,
 
     div("ARP · Output"),
     function()
@@ -2153,7 +2186,7 @@ local function add_arp_section()
     function() params:add_option("arp_swing_mode", "swing mode", {"grid","swing %"}, 1) end,
     function() params:add_number("arp_swing_pct", "swing %", 0, 75, 0) end,
 
-    div("ARP · Pitch/Range"),
+    div("ARP · Pitch/Range (Basics only)"),
     function() params:add_number("arp_transpose_oct", "transpose (oct)", -4, 4, 0) end,
     function() params:add_number("arp_octaves", "octave span (0-4)", 0, 4, 1) end,
     function() params:add_option("arp_oct_walk", "octave travel", {"wrap","bounce"}, 1) end,
@@ -2161,7 +2194,7 @@ local function add_arp_section()
     div("ARP · Material"),
     function() params:add_option("arp_material", "material", {"chord tones","chord + passing"}, 2) end,
 
-    div("ARP · Order"),
+    div("ARP · Order (Basics only)"),
     function()
       params:add_option("arp_order", "order", K.STRUM_OPTS, 1)
       params:set_action("arp_order", function(i) S.arp_order_idx = i end)
@@ -2179,29 +2212,25 @@ local function add_arp_section()
 
     div("ARP · Pattern Library"),
     function()
-      params:add_option("arp_pat_enable", "use pattern library", {"off","on"}, 1)
-      params:set_action("arp_pat_enable", function(i) Arp.set_pat_enable(i) end)
-    end,
-    function()
-      -- stable, sorted genres
       local genres = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()
       params:add_option("arp_pat_genre", "genre", genres, 1)
       params:set_action("arp_pat_genre", function(i)
         Arp.set_genre(i)
         local p = params:lookup_param("arp_pat_name")
         if p then
-          local cur_genre = (params:lookup_param("arp_pat_genre").options or genres)[i] or "Pop"
+          local cur_genre = (params:lookup_param("arp_pat_genre").options or genres)[i] or "Basics"
           p.options = PatternLib.NAMES_FOR(cur_genre)
           p.count   = #p.options
           params:set("arp_pat_name", 1)
           Arp.set_pat(1)
         end
+        update_arp_basics_visibility()
       end)
     end,
     function()
       local function current_genre()
         local pg = params:lookup_param("arp_pat_genre")
-        return (pg and pg.options and pg.options[params:get("arp_pat_genre")]) or "Pop"
+        return (pg and pg.options and pg.options[params:get("arp_pat_genre")]) or "Basics"
       end
       local names = PatternLib.NAMES_FOR(current_genre())
       params:add_option("arp_pat_name", "pattern", names, 1)
@@ -2259,6 +2288,7 @@ function init()
   show_param("free_vel_fixed", S.free.velocity_mode == 1)
   show_param("free_gate_mode", true)
   update_free_visibility()
+  update_arp_basics_visibility()
 
   recompute_root_midi()
   clock.run(clock_loop)
