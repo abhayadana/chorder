@@ -43,7 +43,7 @@ local S = {
   chord_active = {},
 
   -- momentary chord modifiers
-  mod = { seventh=false, ninth=false, sus2=false, sus4=false, add_bass=false, active=false, hint="" },
+  mod = { seventh=false, ninth=false, sus2=false, sus4=false, add_bass=false, mono=false, active=false, hint="" },
 
   -- display
   last_chord_name = nil, last_name_time = 0, last_name_timeout = 2.0,
@@ -171,6 +171,18 @@ local function safe_add_option(id, label, opts, default_index)
   params:add_option(id, label, opts, def)
 end
 
+-- ===== BLACK KEY MOD CONFIG =====
+-- Map black-key pitch classes → mod name
+-- defaults: C#(1)=7th, D#(3)=9th, F#(6)=sus2, G#(8)=sus4, A#(10)=mono
+S.black_mod_map = { [1]="7th", [3]="9th", [6]="sus2", [8]="sus4", [10]="mono" }
+local BLACK_PC_LIST = {1,3,6,8,10}
+local BLACK_PC_NAME = { [1]="C#", [3]="D#", [6]="F#", [8]="G#", [10]="A#" }
+local MOD_OPTS = {"(none)","7th","9th","sus2","sus4","bass","mono"}
+local function set_black_map_from_param(pc, idx)
+  local name = MOD_OPTS[idx]
+  if name == "(none)" then S.black_mod_map[pc] = nil else S.black_mod_map[pc] = name end
+end
+
 -- ===== momentary mod helpers =====
 local function mod_rebuild_hint()
   local parts = {}
@@ -179,6 +191,7 @@ local function mod_rebuild_hint()
   if S.mod.sus2    then parts[#parts+1] = "sus2" end
   if S.mod.sus4    then parts[#parts+1] = "sus4" end
   if S.mod.add_bass then parts[#parts+1] = "+bass" end
+  if S.mod.mono    then parts[#parts+1] = "mono" end
   S.mod.hint = (#parts>0) and table.concat(parts, " ") or ""
   S.mod.active = (#parts>0)
 end
@@ -198,6 +211,8 @@ local function mod_arm(kind, on)
     if on then S.mod.sus2 = false end
   elseif kind == "bass" then
     S.mod.add_bass = on
+  elseif kind == "mono" then
+    S.mod.mono = on
   end
   mod_rebuild_hint()
   redraw()
@@ -207,7 +222,8 @@ local function mod_effective_build()
   local eff_chord_type = (S.mod.ninth and 3) or (S.mod.seventh and 2) or S.chord_type
   local eff_sus_mode   = (S.mod.sus2 and 2) or (S.mod.sus4 and 3) or S.sus_mode
   local eff_add_bass   = S.mod.add_bass or S.add_bass
-  return eff_chord_type, eff_sus_mode, eff_add_bass
+  local eff_mono       = S.mod.mono
+  return eff_chord_type, eff_sus_mode, eff_add_bass, eff_mono
 end
 
 -- ===== MX module =====
@@ -1091,6 +1107,25 @@ local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, ti
 end
 
 local function handle_note_on(canon, root_note, vel, deg)
+  -- If mono mod is active, play just the incoming note (no chord build/strum)
+  local _, _, _, eff_mono = mod_effective_build()
+  if eff_mono then
+    if S.chord_active[root_note] then
+      for _,n in ipairs(S.chord_active[root_note]) do fanout_note_off(canon, n) end
+      S.chord_active[root_note] = nil
+    end
+    S.last_voiced_notes = { root_note }
+    S.last_bass_note = root_note
+    S.chord_active[root_note] = { root_note }
+    S.last_chord_name = (midi_to_name_oct(root_note))
+    S.last_name_time = now()
+    Arp.refresh()
+    Arp.chord_key(true)
+    fanout_note_on(canon, root_note, vel)
+    return
+  end
+
+  -- Normal chord path
   if S.chord_active[root_note] then
     for _,n in ipairs(S.chord_active[root_note]) do fanout_note_off(canon, n) end
     S.chord_active[root_note] = nil
@@ -1322,6 +1357,20 @@ local function items_main_io()
       })
     end
   end
+  -- Velocity source (Chord)
+  table.insert(items, {
+    label = "Vel src",
+    value_str = function()
+      local p = params:lookup_param("chorder_vel_mode")
+      return (p and p.options and p.options[params:get("chorder_vel_mode")]) or "fixed"
+    end,
+    delta = function(d)
+      params:delta("chorder_vel_mode", d)
+      -- keep the Setup page's visibility behavior in sync (optional)
+      local i = params:get("chorder_vel_mode")
+      show_param("chorder_vel_fixed", i == 1)
+    end
+  })
 
   return items
 end
@@ -1467,7 +1516,7 @@ local function items_chord_page()
       value_str=function() return S.scale_name end,
       delta=function(d) params:delta("chorder_scale", d) end
     },
-    -- New on-page editors per your request:
+    -- On-page editors:
     {
       label="Voicing",
       value_str=function() return option_label("chorder_voicing") end,
@@ -1612,12 +1661,9 @@ local function setup_midi_in(param_index)
         local pc = msg.note % 12
 
         if not K.WHITE_SET[pc] then
-          if pc == 1 then       mod_arm("7th", true)
-          elseif pc == 3 then   mod_arm("9th", true)
-          elseif pc == 6 then   mod_arm("sus2", true)
-          elseif pc == 8 then   mod_arm("sus4", true)
-          elseif pc == 10 then  mod_arm("bass", true)
-          end
+          -- configurable black-key mods
+          local m = S.black_mod_map[pc]
+          if m then mod_arm(m, true) end
           return
         end
 
@@ -1641,12 +1687,8 @@ local function setup_midi_in(param_index)
         if K.WHITE_SET[pc] then
           handle_note_off(canon, msg.note)
         else
-          if pc == 1 then       mod_arm("7th", false)
-          elseif pc == 3 then   mod_arm("9th", false)
-          elseif pc == 6 then   mod_arm("sus2", false)
-          elseif pc == 8 then   mod_arm("sus4", false)
-          elseif pc == 10 then  mod_arm("bass", false)
-          end
+          local m = S.black_mod_map[pc]
+          if m then mod_arm(m, false) end
         end
       end
       if S.free.enable and free_ok then free_handle_note_off(msg.note) end
@@ -1881,6 +1923,18 @@ local function add_setup_section()
       params:add_number("chorder_vel_fixed", "fixed velocity (chord)", 1, 127, S.fixed_velocity)
       params:set_action("chorder_vel_fixed", function(v) S.fixed_velocity = util.clamp(v,1,127) end)
     end,
+
+    div("Setup · Black-key mods"),
+    function()
+      for _,pc in ipairs(BLACK_PC_LIST) do
+        local param_id = "bkmod_"..pc
+        local def_idx = 1
+        local cur = S.black_mod_map[pc] or "(none)"
+        for i,n in ipairs(MOD_OPTS) do if n == cur then def_idx = i break end end
+        params:add_option(param_id, BLACK_PC_NAME[pc].." mod", MOD_OPTS, def_idx)
+        params:set_action(param_id, function(i) set_black_map_from_param(pc, i) end)
+      end
+    end,
   })
 end
 
@@ -1892,7 +1946,7 @@ local function add_timing_section()
       params:set_action("chorder_quantize", function(i) S.quantize = (i==2); redraw() end)
     end,
     function()
-      ensure_quant_div_tables(); safe_add_option("chorder_quant_div", "quantize division", K.QUANT_DIV_OPTS, 7) -- 1/4 default for display
+      ensure_quant_div_tables(); safe_add_option("chorder_quant_div", "quantize division", K.QUANT_DIV_OPTS, 7)
       params:set_action("chorder_quant_div", function(i)
         ensure_quant_div_tables()
         S.tick_div_str = K.QUANT_DIV_OPTS[i] or "1/4"
@@ -2112,7 +2166,6 @@ local function add_arp_section()
     div("ARP · Timing"),
     function()
       ensure_quant_div_tables()
-      -- default to 1/4 division
       local def_idx = 7
       safe_add_option("arp_div", "division", K.QUANT_DIV_OPTS, def_idx)
     end,
@@ -2147,7 +2200,7 @@ local function add_arp_section()
     function()
       local genres = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()
       local def = 1
-      for i,n in ipairs(genres) do if n=="Basics" then def=i break end end  -- default to Basics
+      for i,n in ipairs(genres) do if n=="Basics" then def=i break end end
       params:add_option("arp_pat_genre", "genre", genres, def)
       params:set_action("arp_pat_genre", function(i)
         Arp.set_genre(i)
