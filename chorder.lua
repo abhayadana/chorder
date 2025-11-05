@@ -1,8 +1,6 @@
 -- CHORDER — a three-voice chord-based instrument
 -- Author: @abhayadana (refactor pass by ChatGPT)
 -- Engine: mx.samples and/or MIDI
---
--- Long press K3 for HUD
 
 engine.name = "MxSamples"
 
@@ -20,7 +18,7 @@ local DEFAULT_MIDI_OUT_PORT = 1
 -- ===== consolidated state =====
 local S = {
   -- UI pages
-  PAGE_OUTPUT = 1, PAGE_CHORD = 2, PAGE_HUD = 3, page = 1,
+  PAGE_OUTPUT = 1, PAGE_CHORD = 2, page = 1,
 
   -- root / scale
   root_pc = 0, root_oct = 1, root_midi = 24, scale_name = "Major",
@@ -49,10 +47,10 @@ local S = {
     sus4    = false,   -- G# holds = sus4 (mutually exclusive with sus2)
     add_bass= false,   -- A# holds = +bass (force on)
     active  = false,   -- true if any is armed
-    hint    = "",      -- HUD/Chord-page hint text
+    hint    = "",      -- chord-page hint text
   },
 
-  -- display / hud
+  -- display
   last_chord_name = nil, last_name_time = 0, last_name_timeout = 2.0,
 
   -- queue & tokens
@@ -376,6 +374,7 @@ local MIDI = (function()
     end
   end
 
+  private = {}
   local function setup_out(param_index)
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
     if S.midi.out then S.midi.out.event = nil; S.midi.out = nil end
@@ -399,7 +398,6 @@ local MIDI = (function()
     active_clear()
   end
 
-  private = {}
   local function compute_gate_seconds()
     local sel = params:get(S.midi.gate_param) or 1
     if sel == 1 then return nil end
@@ -464,6 +462,7 @@ local PatternLib = (function()
     for i,s in ipairs(template.steps) do t.steps[i] = { d=s.d, oct=s.oct, prob=p, r=s.r, rest=s.rest } end
     t.name = template.name .. string.format(" · p%.2f", p); return t
   end
+  private = {}
   local function ratchet(template, r)
     local t = clone(template); t.steps = {}
     for i,s in ipairs(template.steps) do t.steps[i] = { d=s.d, oct=s.oct, prob=s.prob, r=r, rest=s.rest } end
@@ -544,6 +543,7 @@ local PatternLib = (function()
   local LIB = expand()
   local function genres_list() local t={}; for k,_ in pairs(LIB) do t[#t+1]=k end; table.sort(t); return t end
   local function patterns_for(genre) local t = {}; if LIB[genre] then for _,p in ipairs(LIB[genre]) do t[#t+1]=p.name end end; return (#t>0) and t or {"(none)"} end
+  private = {}
   local function get(genre, idx) local list = LIB[genre]; if not list or #list==0 then return nil end; idx = util.clamp(idx or 1, 1, #list); return list[idx] end
   local function random_for(genre) local list = LIB[genre]; if not list or #list==0 then return nil end; return list[math.random(1,#list)] end
   return { GENRES = genres_list(), NAMES_FOR = patterns_for, GET = get, RAND = random_for }
@@ -573,6 +573,7 @@ local Arp = (function()
     local mval = params:get("arp_out_mode") or 1
     return (mval==1) or (mval==2)
   end
+  private = {}
   local function want_midi()
     local mval = params:get("arp_out_mode") or 1
     return (mval==2) or (mval==3)
@@ -656,6 +657,7 @@ local Arp = (function()
     return best and util.clamp(best, 0, 127) or nil
   end
 
+  private = {}
   local function select_pattern()
     if not A.pat_enable then A.cur_pat=nil; return end
     local pat = (A.pat_random_on_chord and PatternLib.RAND(A.pat_genre)) or PatternLib.GET(A.pat_genre, A.pat_index)
@@ -708,6 +710,7 @@ local Arp = (function()
         local rpat = st.r or 1
         local rglob = params:get("arp_step_ratchet") or 1
         local rat_total = math.max(1, math.floor(rpat * rglob))
+        private = {}
         local rat_prob = (params:get("arp_ratchet_prob") or 100) / 100
         local sub_wait = wait / rat_total
         local sub_dur  = sub_wait * frac
@@ -848,6 +851,7 @@ local Arp = (function()
   local function set_enable(v) A.pat_enable = (v==2); if A.pat_enable then select_pattern() end end
   local function set_genre_idx(i) local g = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()[i] or "Pop"; A.pat_genre = g; A.cur_pat=nil; select_pattern() end
   local function set_pat_idx(i) A.pat_index = i or 1; A.cur_pat=nil; select_pattern() end
+  private = {}
   local function set_rand(v) A.pat_random_on_chord = (v==2) end
 
   return {
@@ -899,6 +903,7 @@ local Free = (function()
     end
   end
 
+  private = {}
   local function free_note_on_mx(canon, note, vel) MX.on_free(canon, note, free_scaled_vel(vel)) end
   local function free_note_off_mx(canon, note) MX.off(canon, note) end
 
@@ -946,6 +951,7 @@ local Free = (function()
     for _,q in pairs(S.free.active_map) do t[#t+1] = q end
     table.sort(t); return t
   end
+  private = {}
   local function free_active_names()
     local t = free_active_notes_ascending()
     if #t == 0 then return nil end
@@ -1292,7 +1298,6 @@ local function key_center_string()
   local name = K.NOTE_NAMES_SHARP[S.root_pc+1]; local rname, roct = midi_to_name_oct(S.root_midi)
   return string.format("%s (root %s%d)", name, rname, roct)
 end
-local function free_key_mode_label() if     S.free.key_mode == 1 then return "white" elseif S.free.key_mode == 2 then return "quantized" else return "chromatic" end end
 
 local function draw_output_page()
   draw_header("I/O")
@@ -1347,7 +1352,7 @@ local function draw_chord_page()
   draw_line(28, "Key:", key_center_string())
   draw_line(40, "Scale:", S.scale_name)
 
-  -- show armed modifier hint on chord page too
+  -- show armed modifier hint on chord page
   if S.mod.active and S.mod.hint ~= "" then
     screen.level(9); screen.move(64, 50); screen.text_center("mods: "..S.mod.hint)
   end
@@ -1362,56 +1367,8 @@ local function draw_chord_page()
   end
 end
 
-local function draw_hud_page()
-  screen.clear()
-  screen.level(9); screen.move(64, 10)
-  local arp_on = (params:get("arp_enable")==2)
-  local trig = (params:get("arp_trigger_mode")==1) and "key-held" or "latch"
-  screen.text_center("Arp: "..(arp_on and trig or "off"))
-  screen.level(9); screen.move(64, 14); screen.text_center("(free: "..free_key_mode_label()..")")
-
-  -- armed modifiers hint
-  if S.mod.active and S.mod.hint ~= "" then
-    screen.level(9); screen.move(64, 20); screen.text_center("mods: "..S.mod.hint)
-  end
-
-  local now_t = now()
-  local show_chord = S.last_chord_name and ((now_t - S.last_name_time) < S.last_name_timeout)
-  local show_free  = S.free.last_name and ((now_t - S.free.last_time) < S.last_name_timeout)
-
-  if show_chord then
-    screen.level(15); pcall(function() screen.font_size(12) end)
-    screen.move(64, 34); screen.text_center(ellipsize(S.last_chord_name, 26))
-    pcall(function() screen.font_size(8) end)
-  else
-    screen.level(10); screen.move(64, 34); screen.text_center("(play a chord)")
-  end
-
-  if show_free then
-    screen.level(12); pcall(function() screen.font_size(10) end)
-    screen.move(64, 50); screen.text_center(ellipsize(S.free.last_name, 26))
-    pcall(function() screen.font_size(8) end)
-  else
-    screen.level(10); screen.move(64, 50); screen.text_center("(free chord)")
-  end
-
-  local t = {}
-  for _,q in pairs(S.free.active_map) do t[#t+1] = q end
-  table.sort(t)
-  local fp = nil
-  if #t>0 then
-    local parts = {}
-    for _,n in ipairs(t) do local nm, oc = midi_to_name_oct(n); parts[#parts+1] = string.format("%s%d", nm, oc) end
-    fp = table.concat(parts, " ")
-  end
-  screen.level(fp and 12 or 10); screen.move(64, 64)
-  screen.text_center("Free: " .. (fp or "—"))
-  screen.update()
-end
-
 function redraw()
   screen.clear()
-  if S.page == S.PAGE_HUD then draw_hud_page(); return end
   if S.page == S.PAGE_OUTPUT then draw_output_page() else draw_chord_page() end
   screen.update()
 end
@@ -2108,26 +2065,13 @@ function init()
 end
 
 -- ===== input handlers =====
-local k3_down_time = nil
-local LONG_PRESS_SEC = 0.35
-
 function key(n, z)
   if n == 2 and z == 1 then
     S.page = (S.page == S.PAGE_OUTPUT) and S.PAGE_CHORD or S.PAGE_OUTPUT
     redraw()
-  elseif n == 3 then
-    if z == 1 then
-      k3_down_time = now()
-    else
-      local held = k3_down_time and (now() - k3_down_time) or 0
-      k3_down_time = nil
-      if held > LONG_PRESS_SEC then
-        S.page = (S.page == S.PAGE_HUD) and S.PAGE_CHORD or S.PAGE_HUD
-        redraw()
-      else
-        panic_all_outputs()
-      end
-    end
+  elseif n == 3 and z == 1 then
+    -- K3: panic
+    panic_all_outputs()
   end
 end
 
