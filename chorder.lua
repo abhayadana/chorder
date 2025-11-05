@@ -2172,29 +2172,8 @@ local function add_arp_section()
     function() params:add_option("arp_swing_mode", "swing mode", {"grid","swing %"}, 1) end,
     function() params:add_number("arp_swing_pct", "swing %", 0, 75, 0) end,
 
-    div("ARP · Pitch/Range (Basics only)"),
-    function() params:add_number("arp_transpose_oct", "transpose (oct)", -4, 4, 0) end,
-    function() params:add_number("arp_octaves", "octave span (0-4)", 0, 4, 1) end,
-    function() params:add_option("arp_oct_walk", "octave travel", {"wrap","bounce"}, 1) end,
-
     div("ARP · Material"),
     function() params:add_option("arp_material", "material", {"chord tones","chord + passing"}, 2) end,
-
-    div("ARP · Order (Basics only)"),
-    function()
-      params:add_option("arp_order", "order", K.STRUM_OPTS, 1)
-      params:set_action("arp_order", function(i) S.arp_order_idx = i end)
-    end,
-
-    div("ARP · Feel / Humanize"),
-    function() params:add_number("arp_vel", "base velocity", 1, 127, 100) end,
-    function() params:add_number("arp_vel_ramp", "velocity ramp/step", -24, 24, 0) end,
-    function() params:add_number("arp_hum_steps", "humanize timing (max steps)", 0, 4, 0) end,
-    function() params:add_number("arp_hum_vel", "humanize velocity (+/-)", 0, 30, 0) end,
-    function() params:add_option("arp_gate", "gate", {"release","25%","50%","75%","100%"}, 1) end,
-    function() params:add_number("arp_step_prob", "global step probability %", 0, 100, 100) end,
-    function() params:add_number("arp_step_ratchet", "global ratchet x", 1, 8, 1) end,
-    function() params:add_number("arp_ratchet_prob", "ratchet hit %", 0, 100, 100) end,
 
     div("ARP · Pattern Library"),
     function()
@@ -2228,6 +2207,27 @@ local function add_arp_section()
       params:add_option("arp_pat_random_on_chord", "new random each chord", {"off","on"}, 1)
       params:set_action("arp_pat_random_on_chord", function(i) Arp.set_rand(i) end)
     end,
+
+    div("ARP · Pitch/Range (Basics only)"),
+    function() params:add_number("arp_transpose_oct", "transpose (oct)", -4, 4, 0) end,
+    function() params:add_number("arp_octaves", "octave span (0-4)", 0, 4, 1) end,
+    function() params:add_option("arp_oct_walk", "octave travel", {"wrap","bounce"}, 1) end,
+    
+    div("ARP · Order (Basics only)"),
+    function()
+      params:add_option("arp_order", "order", K.STRUM_OPTS, 1)
+      params:set_action("arp_order", function(i) S.arp_order_idx = i end)
+    end,
+
+    div("ARP · Feel / Humanize"),
+    function() params:add_number("arp_vel", "base velocity", 1, 127, 100) end,
+    function() params:add_number("arp_vel_ramp", "velocity ramp/step", -24, 24, 0) end,
+    function() params:add_number("arp_hum_steps", "humanize timing (max steps)", 0, 4, 0) end,
+    function() params:add_number("arp_hum_vel", "humanize velocity (+/-)", 0, 30, 0) end,
+    function() params:add_option("arp_gate", "gate", {"release","25%","50%","75%","100%"}, 1) end,
+    function() params:add_number("arp_step_prob", "global step probability %", 0, 100, 100) end,
+    function() params:add_number("arp_step_ratchet", "global ratchet x", 1, 8, 1) end,
+    function() params:add_number("arp_ratchet_prob", "ratchet hit %", 0, 100, 100) end,
   })
 end
 
