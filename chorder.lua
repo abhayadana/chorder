@@ -42,16 +42,8 @@ local S = {
   last_voiced_notes = nil, last_bass_note = nil,
   chord_active = {},
 
-  -- momentary chord modifiers (armed by holding black keys)
-  mod = {
-    seventh = false,   -- C# holds = 7th
-    ninth   = false,   -- D# holds = 9th (mutually exclusive with seventh)
-    sus2    = false,   -- F# holds = sus2
-    sus4    = false,   -- G# holds = sus4 (mutually exclusive with sus2)
-    add_bass= false,   -- A# holds = +bass (force on)
-    active  = false,   -- true if any is armed
-    hint    = "",      -- chord-page hint text
-  },
+  -- momentary chord modifiers
+  mod = { seventh=false, ninth=false, sus2=false, sus4=false, add_bass=false, active=false, hint="" },
 
   -- display
   last_chord_name = nil, last_name_time = 0, last_name_timeout = 2.0,
@@ -113,7 +105,6 @@ local S = {
     active_map={}, chord_active={}, hold_tokens={},
     last_name=nil, last_time=0,
     mx_vol_pct = 100,
-    -- new: memory mirror for param
     hold_to_strum = false,
   },
 }
@@ -124,37 +115,14 @@ local function next_trigger_id() S.trigger_seq = S.trigger_seq + 1; return S.tri
 local K = {
   NOTE_NAMES_SHARP = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"},
   STRUM_OPTS = {
-    "up",
-    "down",
-    "up/down",
-    "down/up",
-    "random",
-    "center-out",
-    "outside-in",
-    "bass-bounce",
-    "treble-bounce",
-    "random no-repeat first",
-    "random stable ends",
-    "edge-kiss",
-    "ping-pair",
-    "arp chunk 2–3",
-    "guitar rake",
-    "harp gliss split",
-    "arp chunk 2–3 ↓",
-    "guitar rake ↓",
-    "harp gliss split (interleaved)",
-    "bass→random",
-    "top→random",
-    "outer→random-mid",
-    "weave low↔high",
-    "weave high↔low",
-    "inside-out (alt)",
-    "inside-out (random)",
-    "odds↑ then evens↑",
-    "evens↑ then odds↑",
+    "up","down","up/down","down/up","random","center-out","outside-in",
+    "bass-bounce","treble-bounce","random no-repeat first","random stable ends",
+    "edge-kiss","ping-pair","arp chunk 2–3","guitar rake","harp gliss split",
+    "arp chunk 2–3 ↓","guitar rake ↓","harp gliss split (interleaved)",
+    "bass→random","top→random","outer→random-mid","weave low↔high","weave high↔low",
+    "inside-out (alt)","inside-out (random)","odds↑ then evens↑","evens↑ then odds↑",
     "low-half↑ then high-half↓",
   },
-  -- reordered in decreasing order
   QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"},
   QUANT_DIV_MAP  = {
     ["4/1"]=4/1, ["3/1"]=3/1, ["2/1"]=2/1, ["1/1"]=1/1, ["1/2"]=1/2, ["1/3"]=1/3, ["1/4"]=1/4,
@@ -195,7 +163,7 @@ local function short_mode_name(mode) if mode=="mx.samples" then return "mx" else
 -- Safe wrapper: never pass nil/empty options into params:add_option
 local function safe_add_option(id, label, opts, default_index)
   if type(opts) ~= "table" or next(opts) == nil then
-    opts = {"(none)"} -- keep params system happy
+    opts = {"(none)"}
   end
   local count = 0
   for _ in pairs(opts) do count = count + 1 end
@@ -235,13 +203,9 @@ local function mod_arm(kind, on)
   redraw()
 end
 
--- Compute effective build parameters for the chord path (momentary overrides)
 local function mod_effective_build()
-  -- chord_type: 1=triad, 2=7th, 3=9th
   local eff_chord_type = (S.mod.ninth and 3) or (S.mod.seventh and 2) or S.chord_type
-  -- sus_mode: 1=normal, 2=sus2, 3=sus4
   local eff_sus_mode   = (S.mod.sus2 and 2) or (S.mod.sus4 and 3) or S.sus_mode
-  -- add_bass: boolean
   local eff_add_bass   = S.mod.add_bass or S.add_bass
   return eff_chord_type, eff_sus_mode, eff_add_bass
 end
@@ -377,7 +341,6 @@ local MIDI = (function()
     end
   end
 
-  private = {}
   local function setup_out(param_index)
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
     if S.midi.out then S.midi.out.event = nil; S.midi.out = nil end
@@ -409,7 +372,6 @@ local MIDI = (function()
     return (60 / bpm) * (S.tick_div or 1/4) * frac
   end
 
-  private = {}
   local function schedule_gate_for_note(note)
     local secs = compute_gate_seconds()
     if not secs or secs <= 0 then return end
@@ -439,8 +401,6 @@ local function scale128()
 end
 
 -- ===== ARP PATTERN LIBRARY =====
--- Degree pattern step format: { d=1..7, oct=-2..+2, rest=true|nil, prob=0..1, r=ratchets>=1 }
--- Basics (legacy-order) patterns: carry markers: { basics=true, use_order=true } or { basics=true, legacy="<name>" }
 local PatternLib = (function()
   local function deg(d, oct, prob, r, rest) return { d=d, oct=oct or 0, prob=prob or 1.0, r=r or 1, rest=rest or false } end
   local function clone(tbl) local t={}; for k,v in pairs(tbl) do t[k]=v end; return t end
@@ -466,7 +426,6 @@ local PatternLib = (function()
     for i,s in ipairs(template.steps) do t.steps[i] = { d=s.d, oct=s.oct, prob=p, r=s.r, rest=s.rest } end
     t.name = template.name .. string.format(" · p%.2f", p); return t
   end
-  private = {}
   local function ratchet(template, r)
     local t = clone(template); t.steps = {}
     for i,s in ipairs(template.steps) do t.steps[i] = { d=s.d, oct=s.oct, prob=s.prob, r=r, rest=s.rest } end
@@ -481,7 +440,7 @@ local PatternLib = (function()
     },
     Rock = {
       { name="rock · power walk", steps={deg(1,0),deg(5,0),deg(1,1),deg(5,0)} },
-      { name="rock · riff 1-♭7-1", steps={deg(1,0),deg(7,-1),deg(1,0),deg(5,0)} },
+      { name="rock · 1-♭7-1-5", steps={deg(1,0),deg(7,-1),deg(1,0),deg(5,0)} },
       { name="rock · 1-4-5 climb", steps={deg(1),deg(4),deg(5),deg(1,1)} },
       updown135("rock · 1-3-5-3"),
     },
@@ -523,12 +482,10 @@ local PatternLib = (function()
     }
   }
 
-  -- === Basics (folded legacy "orders") =======================
-  -- We provide a "use arp_order" item which defers to the arp_order param,
-  -- plus fixed variants that map to specific Strum orders.
+  -- Basics patterns (folded legacy "orders")
   local function basics_patterns()
     return {
-      { name="basics · use arp_order", basics=true, use_order=true }, -- uses params: arp_order/octaves/oct_walk
+      { name="basics · use arp_order", basics=true, use_order=true },
       { name="basics · up",            basics=true, legacy="up" },
       { name="basics · down",          basics=true, legacy="down" },
       { name="basics · up/down",       basics=true, legacy="up/down" },
@@ -536,7 +493,6 @@ local PatternLib = (function()
       { name="basics · random",        basics=true, legacy="random" },
       { name="basics · center-out",    basics=true, legacy="center-out" },
       { name="basics · outside-in",    basics=true, legacy="outside-in" },
-      -- extra variants requested
       { name="basics · random no-repeat first", basics=true, legacy="random no-repeat first" },
       { name="basics · random stable ends",     basics=true, legacy="random stable ends" },
     }
@@ -560,16 +516,13 @@ local PatternLib = (function()
           steps={deg(1,o),deg(2,o),deg(3,o),deg(4,o),deg(5,o),deg(6,o),deg(5,o),deg(4,o)} })
       end
     end
-
     lib["Basics"] = basics_patterns()
-
     return lib
   end
 
   local LIB = expand()
   local function genres_list() local t={}; for k,_ in pairs(LIB) do t[#t+1]=k end; table.sort(t); return t end
   local function patterns_for(genre) local t = {}; if LIB[genre] then for _,p in ipairs(LIB[genre]) do t[#t+1]=p.name end end; return (#t>0) and t or {"(none)"} end
-  private = {}
   local function get(genre, idx) local list = LIB[genre]; if not list or #list==0 then return nil end; idx = util.clamp(idx or 1, 1, #list); return list[idx] end
   local function random_for(genre) local list = LIB[genre]; if not list or #list==0 then return nil end; return list[math.random(1,#list)] end
   return { GENRES = genres_list(), NAMES_FOR = patterns_for, GET = get, RAND = random_for }
@@ -584,7 +537,7 @@ local Arp = (function()
     notes_buf = {},
     emitted = {},
     coro = nil,
-    mout = nil, -- dedicated MIDI out (no sentinel)
+    mout = nil,
 
     -- pattern system (always ON)
     pat_genre = "Basics",
@@ -598,7 +551,6 @@ local Arp = (function()
     local mval = params:get("arp_out_mode") or 1
     return (mval==1) or (mval==2)
   end
-  private = {}
   local function want_midi()
     local mval = params:get("arp_out_mode") or 1
     return (mval==2) or (mval==3)
@@ -636,7 +588,6 @@ local Arp = (function()
     table.sort(out); return out
   end
 
-  private = {}
   local function make_material()
     local base_notes = {}
     if type(S.last_voiced_notes)=="table" and #S.last_voiced_notes>0 then
@@ -663,23 +614,15 @@ local Arp = (function()
 
   -- map names for Basics fixed variants -> Strum indices
   local LEGACY_TO_STRUM_IDX = {
-    ["up"]                      = 1,
-    ["down"]                    = 2,
-    ["up/down"]                 = 3,
-    ["down/up"]                 = 4,
-    ["random"]                  = 5,
-    ["center-out"]              = 6,
-    ["outside-in"]              = 7,
-    ["random no-repeat first"]  = 10,
-    ["random stable ends"]      = 11,
+    ["up"]=1,["down"]=2,["up/down"]=3,["down/up"]=4,["random"]=5,
+    ["center-out"]=6,["outside-in"]=7,
+    ["random no-repeat first"]=10,["random stable ends"]=11,
   }
 
   local function basics_next_note(step_i)
-    -- ensure material exists
     if not A.notes_buf or #A.notes_buf == 0 then make_material() end
     if not A.notes_buf or #A.notes_buf == 0 then return nil end
 
-    -- choose order
     local stype
     if A.cur_pat and A.cur_pat.use_order then
       stype = params:get("arp_order") or 1
@@ -694,7 +637,6 @@ local Arp = (function()
     local idx = ord[((step_i-1) % #ord) + 1]
     local base = A.notes_buf[idx]
 
-    -- octave travel (globals, apply to Basics only)
     local span = params:get("arp_octaves") or 1
     local walk = params:get("arp_oct_walk") or 1 -- 1=wrap, 2=bounce
     local t = math.floor((step_i-1)/#ord)
@@ -731,17 +673,22 @@ local Arp = (function()
     return best and util.clamp(best, 0, 127) or nil
   end
 
-  private = {}
+  -- ROBUST: don't read params that don't exist yet
   local function select_pattern()
-    local pat = (params:get("arp_pat_random_on_chord")==2 and PatternLib.RAND(A.pat_genre))
+    local random_on = false
+    local p = params:lookup_param("arp_pat_random_on_chord")
+    if p then
+      random_on = (params:get("arp_pat_random_on_chord") == 2)
+    end
+    local pat = (random_on and PatternLib.RAND(A.pat_genre))
                  or PatternLib.GET(A.pat_genre, A.pat_index)
     A.cur_pat = pat
     if pat then print("ARP pattern: "..(pat.name or "(unnamed)")) end
   end
 
   local function step_seconds()
-    local opt = K.QUANT_DIV_OPTS[params:get("arp_div") or 9] or "1/8"
-    local div = K.QUANT_DIV_MAP[opt] or 1/8
+    local opt = K.QUANT_DIV_OPTS[params:get("arp_div") or 7] or "1/4"
+    local div = K.QUANT_DIV_MAP[opt] or 1/4
     return Feel.step_seconds(div, clock.get_tempo(), params:get("arp_swing_mode") or 1, params:get("arp_swing_pct") or 0, A.step_i)
   end
 
@@ -760,20 +707,16 @@ local Arp = (function()
     local wait = step_seconds()
     local gprob = (params:get("arp_step_prob") or 100) / 100
 
-    -- resolve target note (Basics vs Degree)
     local n = nil
     if A.cur_pat.basics then
-      -- recompute material when needed
       if (params:get("arp_retrack")==2) then
         local ord = select(1, Strum.make(math.max(#A.notes_buf,1), (params:get("arp_order") or 1), A.ord_state)) or {}
         if (#A.notes_buf > 0) and ((A.step_i-1) % math.max(#ord,1) == 0) then make_material() end
       end
-      -- step probability (Basics obey global only)
       if math.random() <= gprob then
         n = basics_next_note(A.step_i)
       end
     else
-      -- Degree pattern
       local steps = A.cur_pat.steps or {}
       if #steps > 0 then
         local idx = ((A.step_i-1) % #steps) + 1
@@ -825,10 +768,8 @@ local Arp = (function()
     while A.running do
       local wait = step_seconds()
       local freerun = (params:get("arp_free_run") or 1) == 2
-      -- If free-run is ON, run even without a fresh chord; otherwise run only while a chord is active
       if freerun or A.has_chord then
         if not A.cur_pat then select_pattern() end
-        -- Ensure material when Basics selected
         if A.cur_pat and A.cur_pat.basics then
           if #A.notes_buf == 0 then make_material() end
         end
@@ -856,7 +797,6 @@ local Arp = (function()
       select_pattern()
       A.step_i = 1
     else
-      -- in key-held mode, stop is gated by UI; free-run ignores has_chord
       A.has_chord = false
     end
   end
@@ -873,7 +813,6 @@ local Arp = (function()
     A.cur_pat=nil
     select_pattern()
   end
-  private = {}
   local function set_pat_idx(i) A.pat_index = i or 1; A.cur_pat=nil; select_pattern() end
   local function set_rand(v) A.pat_random_on_chord = (v==2) end
 
@@ -926,10 +865,10 @@ local Free = (function()
     end
   end
 
-  private = {}
   local function free_note_on_mx(canon, note, vel) MX.on_free(canon, note, free_scaled_vel(vel)) end
   local function free_note_off_mx(canon, note) MX.off(canon, note) end
 
+  private = {}
   local function free_note_on_midi(note, vel)
     if S.free.mout then
       pcall(function() S.free.mout:note_on(util.clamp(note,0,127), util.clamp(vel or 100,1,127), S.free.midi_channel) end)
@@ -945,7 +884,6 @@ local Free = (function()
     if free_want_mx()   then free_note_on_mx(canon, note, vel) end
     if free_want_midi() then free_note_on_midi(note, vel) end
   end
-  private = {}
   local function free_fanout_off(canon, note)
     if free_want_mx()   then free_note_off_mx(canon, note) end
     if free_want_midi() then free_note_off_midi(note) end
@@ -975,7 +913,6 @@ local Free = (function()
     for _,q in pairs(S.free.active_map) do t[#t+1] = q end
     table.sort(t); return t
   end
-  private = {}
   local function free_active_names()
     local t = free_active_notes_ascending()
     if #t == 0 then return nil end
@@ -989,7 +926,6 @@ local Free = (function()
     return chordlib.quantize_to_scale(sc, note)
   end
 
-  private = {}
   local function free_make_strum_order(count)
     local tmp_state = { alt_flip=false, last_first=nil, last_last=nil }
     local ord = select(1, Strum.make(count, S.free.strum_type, tmp_state))
@@ -1070,20 +1006,12 @@ end
 
 local function build_chord_and_symbol(root_note, deg)
   local sc = scale128()
-  -- apply momentary overrides while computing
   local eff_ct, eff_sus, eff_bass = mod_effective_build()
   local notes, qual, name_root_midi = chordlib.build_chord{
-    scale = sc,
-    base_midi = root_note,
-    degree = deg,
-    chord_type = eff_ct,
-    inversion = S.inversion,
-    spread = S.spread,
-    sus_mode = eff_sus,
-    voicing_mode = S.voicing,
-    add_bass = eff_bass,
-    last_voiced_notes = S.last_voiced_notes,
-    last_bass_note = S.last_bass_note
+    scale = sc, base_midi = root_note, degree = deg,
+    chord_type = eff_ct, inversion = S.inversion, spread = S.spread,
+    sus_mode = eff_sus, voicing_mode = S.voicing, add_bass = eff_bass,
+    last_voiced_notes = S.last_voiced_notes, last_bass_note = S.last_bass_note
   }
   local symbol = chordlib.symbol_for(notes, qual, name_root_midi, {
     chord_type = eff_ct, sus_mode = eff_sus, inversion = S.inversion,
@@ -1092,7 +1020,6 @@ local function build_chord_and_symbol(root_note, deg)
   return notes, symbol, qual, name_root_midi
 end
 
--- schedule one full strum pass; optionally re-schedule itself for repeating
 local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, tid, cycle_idx, hold_guard)
   local chord = select(1, build_chord_and_symbol(root_note, deg))
   if not chord or #chord == 0 then return end
@@ -1324,26 +1251,11 @@ local function key_center_string()
   return string.format("%s (root %s%d)", name, rname, roct)
 end
 
--- extra UI helpers for selector/editor mode
-local function caret_at(line_y, selected)  -- draw '>' for selection
-  if selected then
-    screen.level(15); screen.move(2, line_y); screen.text(">")
-  end
-end
-local function clamp_cursor(cur, n)
-  return util.clamp(cur or 1, 1, math.max(1, n or 1))
-end
-local function short_mode_from_param(id, opts_tbl)
-  local full = opts_tbl[(params:get(id) or 1)] or "?"
-  return short_mode_name(full)
-end
-local function current_midi_out_label(idx)
-  return ellipsize(S.midi.devices[idx or (params:get(S.midi.out_dev_param) or 1)] or "—", 16)
-end
-local function current_midi_in_label()
-  local i = params:get(S.midi.in_dev_param) or 1
-  return ellipsize(S.midi.in_devices[i] or "none", 16)
-end
+local function caret_at(line_y, selected) if selected then screen.level(15); screen.move(2, line_y); screen.text(">") end end
+local function clamp_cursor(cur, n) return util.clamp(cur or 1, 1, math.max(1, n or 1)) end
+local function short_mode_from_param(id, opts_tbl) local full = opts_tbl[(params:get(id) or 1)] or "?" return short_mode_name(full) end
+local function current_midi_out_label(idx) return ellipsize(S.midi.devices[idx or (params:get(S.midi.out_dev_param) or 1)] or "—", 16) end
+local function current_midi_in_label() local i = params:get(S.midi.in_dev_param) or 1; return ellipsize(S.midi.in_devices[i] or "none", 16) end
 local function channel_disp(idx) return (idx==1) and "Omni" or ("Ch"..tostring((idx or 2)-1)) end
 
 -- ===== Page items (focus/edit model) =====
@@ -1378,7 +1290,7 @@ local function items_main_io()
     delta = function(d) params:delta(S.out_mode_param, d) end
   })
 
-  -- If mx, show mx.samples voice; else if MIDI present show MIDI device
+  -- If mx, show mx.samples voice and mx volume; else if MIDI present show MIDI device
   do
     local out_short = short_mode_from_param(S.out_mode_param, OUT_OPTS)
     if out_short == "mx" or out_short == "mx+M" then
@@ -1388,6 +1300,11 @@ local function items_main_io()
           return ellipsize(S.display_names[params:get("chorder_mx_voice") or S.voice_index] or "(no packs)", 20)
         end,
         delta = function(d) params:delta("chorder_mx_voice", d) end
+      })
+      table.insert(items, {
+        label = "mx vol",
+        value_str = function() return tostring(params:get("chorder_mx_vol_pct") or S.mx_vol_pct).."%" end,
+        delta = function(d) params:delta("chorder_mx_vol_pct", d > 0 and 1 or -1) end
       })
     end
     if out_short == "MIDI" or out_short == "mx+M" then
@@ -1412,20 +1329,17 @@ end
 local function items_free_io()
   local items = {}
 
-  -- Toggle
   table.insert(items, {
     label = "Free",
     value_str = function() return (params:get("free_enable")==2) and "on" or "off" end,
     delta = function(d) params:delta("free_enable", d) end
   })
 
-  -- In (channel only)
   table.insert(items, {
     label = "In Ch",
     value_str = function() return tostring(params:get(S.free.midi_in_ch_param) or 2) end,
     delta = function(d) params:delta(S.free.midi_in_ch_param, d > 0 and 1 or -1) end
   })
-  -- Out mode
   table.insert(items, {
     label = "Out",
     value_str = function()
@@ -1434,7 +1348,6 @@ local function items_free_io()
     delta = function(d) params:delta(S.free.out_mode_param, d) end
   })
 
-  -- If mx, voice; if MIDI present, device/ch
   do
     local out_short = short_mode_from_param(S.free.out_mode_param, S.free.out_opts)
     if out_short == "mx" or out_short == "mx+M" then
@@ -1444,6 +1357,11 @@ local function items_free_io()
           return ellipsize(S.display_names[params:get("free_mx_voice") or S.free.voice_index] or "(no packs)", 20)
         end,
         delta = function(d) params:delta("free_mx_voice", d) end
+      })
+      table.insert(items, {
+        label = "mx vol",
+        value_str = function() return tostring(params:get("free_mx_vol_pct") or S.free.mx_vol_pct).."%" end,
+        delta = function(d) params:delta("free_mx_vol_pct", d > 0 and 1 or -1) end
       })
     end
     if out_short == "MIDI" or out_short == "mx+M" then
@@ -1472,14 +1390,12 @@ end
 local function items_arp_io()
   local items = {}
 
-  -- Always on (transport gate handled by Arp.start/stop)
   table.insert(items, {
     label = "Arp",
     value_str = function() return (params:get("arp_enable")==2) and "on" or "off" end,
     delta = function(d) params:delta("arp_enable", d) end
   })
 
-  -- Out mode
   table.insert(items, {
     label = "Out",
     value_str = function()
@@ -1490,7 +1406,6 @@ local function items_arp_io()
     delta = function(d) params:delta("arp_out_mode", d) end
   })
 
-  -- If mx, voice; if MIDI present, device/ch
   do
     local out_opts = {"mx.samples","mx.samples + MIDI","MIDI"}
     local full = out_opts[params:get("arp_out_mode") or 1] or "?"
@@ -1502,6 +1417,11 @@ local function items_arp_io()
           return ellipsize(S.display_names[params:get("arp_mx_voice") or 1] or "(no packs)", 20)
         end,
         delta = function(d) params:delta("arp_mx_voice", d) end
+      })
+      table.insert(items, {
+        label = "mx vol",
+        value_str = function() return tostring(params:get("arp_mx_vol_pct") or S.arp_mx_vol_pct).."%" end,
+        delta = function(d) params:delta("arp_mx_vol_pct", d > 0 and 1 or -1) end
       })
     end
     if out_short == "MIDI" or out_short == "mx+M" then
@@ -1528,6 +1448,14 @@ local function items_arp_io()
 end
 
 local function items_chord_page()
+  -- Pull current option labels from params so UI mirrors param sets
+  local function option_label(id)
+    local p = params:lookup_param(id)
+    if not p or not p.options then return "?" end
+    local i = params:get(id) or 1
+    return p.options[i] or "?"
+  end
+
   return {
     {
       label="Key",
@@ -1539,6 +1467,17 @@ local function items_chord_page()
       value_str=function() return S.scale_name end,
       delta=function(d) params:delta("chorder_scale", d) end
     },
+    -- New on-page editors per your request:
+    {
+      label="Voicing",
+      value_str=function() return option_label("chorder_voicing") end,
+      delta=function(d) params:delta("chorder_voicing", d) end
+    },
+    {
+      label="Add Bass",
+      value_str=function() return option_label("chorder_bass_note") end,
+      delta=function(d) params:delta("chorder_bass_note", d > 0 and 1 or -1) end
+    },
   }
 end
 
@@ -1549,7 +1488,7 @@ local function draw_items_list(y_start, items, cursor_idx)
     local selected = (i == cursor_idx)
     caret_at(y, selected)
     draw_line(y, it.label..":", it.value_str and it.value_str() or "")
-    y = y + 9
+    y = y + 8
   end
 end
 
@@ -1581,13 +1520,13 @@ local function draw_chord_page()
   draw_items_list(24, items, S.cursor.CHORD)
 
   if S.mod.active and S.mod.hint ~= "" then
-    screen.level(9); screen.move(64, 50); screen.text_center("mods: "..S.mod.hint)
+    screen.level(9); screen.move(64, 55); screen.text_center("mods: "..S.mod.hint)
   end
 
   local now_t = now()
   local show_name = S.last_chord_name and ((now_t - S.last_name_time) < S.last_name_timeout)
   screen.level(show_name and 15 or 10)
-  screen.move(64, 60); screen.text_center(show_name and ellipsize(S.last_chord_name, 26) or "(play a chord)")
+  screen.move(64, 62); screen.text_center(show_name and ellipsize(S.last_chord_name, 26) or "(play a chord)")
 end
 
 function redraw()
@@ -1595,7 +1534,7 @@ function redraw()
   if     S.page == S.PAGE_MAIN_IO then draw_main_io_page()
   elseif S.page == S.PAGE_FREE_IO then draw_free_io_page()
   elseif S.page == S.PAGE_ARP     then draw_arp_io_page()
-  else                                 draw_chord_page()      -- PAGE_CHORD
+  else                                 draw_chord_page()
   end
   screen.update()
 end
@@ -1606,7 +1545,6 @@ local function build_group(title, builders)
   local counter = 0
   local proxy = {}
   local function bump() counter = counter + 1 end
-  -- proxy implements add_* and ignores side effects during probe
   proxy.add_option   = function(...) bump() end
   proxy.add_number   = function(...) bump() end
   proxy.add_trigger  = function(...) bump() end
@@ -1620,7 +1558,6 @@ local function build_group(title, builders)
   proxy.lookup_param = function(...) return nil end
   setmetatable(proxy, { __index = function() return function(...) end end })
 
-  -- pass 1: count
   params = proxy
   for _,fn in ipairs(builders) do fn() end
   params = real
@@ -1675,8 +1612,6 @@ local function setup_midi_in(param_index)
         local pc = msg.note % 12
 
         if not K.WHITE_SET[pc] then
-          -- BLACK KEYS (momentary arm while held):
-          -- C#(1):7th, D#(3):9th, F#(6):sus2, G#(8):sus4, A#(10):+bass
           if pc == 1 then       mod_arm("7th", true)
           elseif pc == 3 then   mod_arm("9th", true)
           elseif pc == 6 then   mod_arm("sus2", true)
@@ -1686,7 +1621,6 @@ local function setup_midi_in(param_index)
           return
         end
 
-        -- WHITE KEYS (diatonic degrees) → Chord path
         local deg = K.WHITE_TO_DEG[pc]
         if deg then
           MX.ensure_loaded(S.voice_index)
@@ -1707,7 +1641,6 @@ local function setup_midi_in(param_index)
         if K.WHITE_SET[pc] then
           handle_note_off(canon, msg.note)
         else
-          -- BLACK KEY release = disarm
           if pc == 1 then       mod_arm("7th", false)
           elseif pc == 3 then   mod_arm("9th", false)
           elseif pc == 6 then   mod_arm("sus2", false)
@@ -1778,7 +1711,6 @@ end
 local function show_param(id, show) local p=params:lookup_param(id); if not p then return end; if show then params:show(id) else params:hide(id) end end
 
 local function update_free_visibility()
-  -- Only toggle params that actually exist
   local chroma = (S.free.key_mode == 3)
   show_param("free_mode",                not chroma)
   show_param("free_chord_type",          not chroma)
@@ -1790,10 +1722,8 @@ local function update_free_visibility()
   show_param("free_strum_steps",         not chroma)
   show_param("free_strum_type",          not chroma)
   show_param("free_hold_strum",          not chroma)
-  -- velocity/gate always visible
   show_param("free_vel_fixed",           true)
   show_param("free_gate_mode",           true)
-  -- dynamics & flam remain visible (safe)
 end
 
 local function update_arp_basics_visibility()
@@ -1803,7 +1733,6 @@ local function update_arp_basics_visibility()
     local gname = pg.options[params:get("arp_pat_genre") or 1]
     is_basics = (gname == "Basics")
   end
-  -- Only Basics uses these globals
   show_param("arp_order",   is_basics)
   show_param("arp_octaves", is_basics)
   show_param("arp_oct_walk",is_basics)
@@ -1963,7 +1892,7 @@ local function add_timing_section()
       params:set_action("chorder_quantize", function(i) S.quantize = (i==2); redraw() end)
     end,
     function()
-      ensure_quant_div_tables(); safe_add_option("chorder_quant_div", "quantize division", K.QUANT_DIV_OPTS, 4)
+      ensure_quant_div_tables(); safe_add_option("chorder_quant_div", "quantize division", K.QUANT_DIV_OPTS, 7) -- 1/4 default for display
       params:set_action("chorder_quant_div", function(i)
         ensure_quant_div_tables()
         S.tick_div_str = K.QUANT_DIV_OPTS[i] or "1/4"
@@ -1992,7 +1921,6 @@ local function add_timing_section()
       params:add_option("chorder_strum_type", "strum type", K.STRUM_OPTS, S.strum_type)
       params:set_action("chorder_strum_type", function(i)
         S.strum_type = i
-        -- reset alternating memory so patterns start deterministically
         strum_state = { alt_flip=false, last_first=nil, last_last=nil }
         redraw()
       end)
@@ -2182,7 +2110,12 @@ local function add_arp_section()
     end,
 
     div("ARP · Timing"),
-    function() ensure_quant_div_tables(); safe_add_option("arp_div", "division", K.QUANT_DIV_OPTS, 9) end, -- default 1/8
+    function()
+      ensure_quant_div_tables()
+      -- default to 1/4 division
+      local def_idx = 7
+      safe_add_option("arp_div", "division", K.QUANT_DIV_OPTS, def_idx)
+    end,
     function() params:add_option("arp_swing_mode", "swing mode", {"grid","swing %"}, 1) end,
     function() params:add_number("arp_swing_pct", "swing %", 0, 75, 0) end,
 
@@ -2213,7 +2146,9 @@ local function add_arp_section()
     div("ARP · Pattern Library"),
     function()
       local genres = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()
-      params:add_option("arp_pat_genre", "genre", genres, 1)
+      local def = 1
+      for i,n in ipairs(genres) do if n=="Basics" then def=i break end end  -- default to Basics
+      params:add_option("arp_pat_genre", "genre", genres, def)
       params:set_action("arp_pat_genre", function(i)
         Arp.set_genre(i)
         local p = params:lookup_param("arp_pat_name")
@@ -2314,14 +2249,12 @@ function key(n, z)
 end
 
 function enc(n, d)
-  -- E1: page nav
   if n == 1 then
     S.page = util.clamp(S.page + (d>0 and 1 or (d<0 and -1 or 0)), 1, 4)
     redraw()
     return
   end
 
-  -- E2: move cursor; E3: edit selected
   local items, cur_ref
   if S.page == S.PAGE_MAIN_IO then
     items, cur_ref = items_main_io(), "MAIN"
@@ -2334,7 +2267,6 @@ function enc(n, d)
   end
 
   if n == 2 then
-    -- move selection
     local cur = clamp_cursor(S.cursor[cur_ref], #items)
     cur = util.clamp(cur + (d>0 and 1 or -1), 1, #items)
     S.cursor[cur_ref] = cur
@@ -2343,7 +2275,6 @@ function enc(n, d)
   end
 
   if n == 3 then
-    -- edit selected
     local cur = clamp_cursor(S.cursor[cur_ref], #items)
     local it = items[cur]
     if it and it.delta then it.delta(d) end
