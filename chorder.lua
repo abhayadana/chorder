@@ -498,6 +498,8 @@ local Arp = (function()
     emitted = {},
     coro = nil,
     mout = nil,
+    phase_anchor = nil,   -- absolute time (util.time()) we last anchored the phase to
+    latched = false,      -- whether we are in latch behavior right now
 
     -- pattern system (always ON)
     pat_genre = "Basics",
@@ -667,6 +669,10 @@ local Arp = (function()
     return Feel.step_seconds(div, clock.get_tempo(), params:get("arp_swing_mode") or 1, params:get("arp_swing_pct") or 0, A.step_i)
   end
 
+  local function anchor_next_time()
+  return (A.phase_anchor or util.time()) + step_seconds()
+  end
+
   local function play_note_with_gate(n, vel, dur)
     fanout_on(n, vel)
     A.emitted[n]=true
@@ -740,23 +746,37 @@ local Arp = (function()
   local function run()
     A.running = true
     A.step_i  = 1
+    -- if no anchor yet, start now so we don't drift
+    if not A.phase_anchor then A.phase_anchor = util.time() end
+
     while A.running do
-      local wait = step_seconds()
       local freerun = (params:get("arp_free_run") or 1) == 2
-      if freerun or A.has_chord then
+      local latch   = (params:get("arp_trigger_mode") or 1) == 2
+      A.latched = latch
+
+      if freerun or A.has_chord or latch then
+        -- sleep until the next anchored boundary
+        local now_t = util.time()
+        local due   = anchor_next_time()
+        local wait  = math.max(0, due - now_t)
+        clock.sleep(wait)
+
+        -- advance anchor and perform a step
+        A.phase_anchor = due
         if not A.cur_pat then select_pattern() end
-        if A.cur_pat and A.cur_pat.basics then
-          if #A.notes_buf == 0 then make_material() end
-        end
+        if A.cur_pat and A.cur_pat.basics and (#A.notes_buf == 0) then make_material() end
         step_once_pattern()
+      else
+        -- idle cheaply when no chord and not latched
+        clock.sleep(0.01)
       end
-      clock.sleep(wait)
     end
   end
 
   local function start()
     A.running = true
     if A.coro then clock.cancel(A.coro) end
+    -- do not force phase_anchor here; let chord_key or run() set it appropriately
     A.coro = clock.run(run)
   end
   local function stop()
@@ -764,19 +784,33 @@ local Arp = (function()
     A.running = false
     if A.coro then clock.cancel(A.coro); A.coro=nil end
     all_off()
+    -- keep A.phase_anchor as-is; a later key press in key-held will re-anchor
   end
 
   local function chord_key(down)
+    local freerun = (params:get("arp_free_run") or 1) == 2
+    local latch   = (params:get("arp_trigger_mode") or 1) == 2
+
     if down then
       A.has_chord = true
       select_pattern()
       A.step_i = 1
-      -- immediate first step so short taps still sound
-      if (params:get("arp_trigger_mode") or 1) == 1 then
+
+      -- re-anchor phase ONLY for key-held (your requested behavior)
+      if (not freerun) and (not latch) then
+        A.phase_anchor = util.time()  -- press = phase origin
+        -- emit immediate first step so short taps register
         step_once_pattern()
+      else
+        -- latch or free-run: do NOT re-anchor; allow continuous cadence
+        if (params:get("arp_trigger_mode") or 1) == 1 then
+          step_once_pattern() -- optional: keep the immediate first hit behavior
+        end
       end
     else
       A.has_chord = false
+      -- leaving anchor intact means if you press again soon, it will re-anchor (key-held)
+      -- latch mode keeps running regardless
     end
   end
 
@@ -1000,6 +1034,11 @@ local function panic_all_outputs()
   else
     S.freeA.hold_tokens, S.freeB.hold_tokens = {}, {}
     S.freeA.cycle_tokens, S.freeB.cycle_tokens = {}, {}
+  end
+
+  -- AUTO-RESUME if arp_enable is still ON
+  if (params:get("arp_enable") or 1) == 2 then
+    if Arp and Arp.start then Arp.start() end
   end
 
   S.chord_hold_tokens = {}
