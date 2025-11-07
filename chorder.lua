@@ -9,7 +9,7 @@ local mxsamples = include "mx.samples/lib/mx.samples"
 local chordlib  = include "lib/chordlib"
 local Strum     = include "lib/strum"
 local Feel      = include "lib/feel"
-local PatternLib= include "lib/patternlib"
+local PatternLib= include "lib/patternlib"  -- externalized ARP pattern library
 
 -- ===== config =====
 local BASE = _path.audio .. "mx.samples"
@@ -52,12 +52,12 @@ local S = {
   -- queue & tokens
   evq = {},
   trigger_seq = 0,
-  chord_hold_tokens = {},   -- still used to manage offs; no longer gates strum emission
-  chord_cycle_tokens = {},  -- used to allow/cancel scheduled strum steps + repeats
+  chord_hold_tokens = {},
+  chord_cycle_tokens = {},   -- per-root cycle token (valid for current strum pass)
 
   -- output mode & levels
-  out_mode_param = "chorder_out_mode"
-  ,mx_vol_pct = 100,          -- Chord path MX volume
+  out_mode_param = "chorder_out_mode",
+  mx_vol_pct = 100,          -- Chord path MX volume
   arp_mx_vol_pct = 100,      -- Arp path MX volume
 
   -- MIDI (Chord path)
@@ -106,7 +106,7 @@ local S = {
     midi_in_ch_param  = "free_midi_in_ch",
     mout=nil,
     -- live state
-    active_map={}, chord_active={}, hold_tokens={}, cycle_tokens={},
+    active_map={}, chord_active={}, hold_tokens={}, cycle_tokens={}, -- cycle_tokens
     last_name=nil, last_time=0,
     mx_vol_pct = 100,
     hold_to_strum = false,
@@ -142,7 +142,7 @@ local S = {
     midi_in_ch_param  = "freeb_midi_in_ch",
     mout=nil,
     -- live state
-    active_map={}, chord_active={}, hold_tokens={}, cycle_tokens={},
+    active_map={}, chord_active={}, hold_tokens={}, cycle_tokens={}, -- cycle_tokens
     last_name=nil, last_time=0,
     mx_vol_pct = 100,
     hold_to_strum = false,
@@ -537,8 +537,6 @@ local Arp = (function()
     if rebind_midi_in_if_needed then rebind_midi_in_if_needed() end
   end
 
-  private_run = nil
-
   local function fanout_on(note, vel)
     local canon = S.canonical_names[params:get("arp_mx_voice") or 1] or ""
     if want_midi() and A.mout then
@@ -771,8 +769,10 @@ local Arp = (function()
       A.has_chord = true
       select_pattern()
       A.step_i = 1
-      -- immediate first step so short taps still sound
-      if (params:get("arp_trigger_mode") or 1) == 1 then
+      -- only auto-fire for key-held mode; latch can stay grid-based (or implement separately)
+      local trig_mode = params:get("arp_trigger_mode") or 1 -- 1=key-held, 2=latch
+      if trig_mode == 1 then
+        -- immediate first step so short taps still sound
         step_once_pattern()
       end
     else
@@ -811,6 +811,7 @@ local function want_mx()   local mval = params:get(S.out_mode_param) or 1; retur
 local function want_midi() local mval = params:get(S.out_mode_param) or 1; return (mval==2) or (mval==3) end
 local function mx_scaled_vel(v) local scaled = math.floor((v or 100) * (S.mx_vol_pct / 100)); return util.clamp(scaled, 1, 127) end
 
+-- CHANGED: removed timed MIDI gate; chord notes sustain until release
 local function fanout_note_on(canon, note, vel)
   if want_mx()   then MX.on_chord(canon, note, mx_scaled_vel(vel)) end
   if want_midi() then MIDI.on(note, vel) end
@@ -1031,8 +1032,7 @@ local function build_chord_and_symbol(root_note, deg)
 end
 
 -- ====== TOKEN-BASED STRUM PASSES (Chord) ======
--- IMPORTANT: emission is now gated by CYCLE token (not HOLD), so strum completes
--- unless key release cancels future steps by clearing the cycle token.
+-- CHANGED: sustain all emitted chord MIDI until key release; no pass-end auto-offs.
 local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, hold_tid, cycle_tid, cycle_idx)
   local chord = select(1, build_chord_and_symbol(root_note, deg))
   if not chord or #chord == 0 then return end
@@ -1054,8 +1054,8 @@ local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, ho
   local flam_space = params:get("chorder_flam_space") or 1
   local flam_dvel  = params:get("chorder_flam_vel") or -8
 
+  local emitted_this_pass = {}
   local pass_last = 0
-  local is_repeat_cycle = (cycle_idx or 1) > 1
 
   for k, idx in ipairs(order) do
     local n = chord[idx]
@@ -1073,9 +1073,9 @@ local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, ho
     pass_last = math.max(pass_last, s0 + (flam_on and (flam_cnt*flam_space) or 0))
 
     schedule(s, function()
-      if S.chord_cycle_tokens[root_note] == cycle_tid then
-        if is_repeat_cycle then fanout_note_off(canon, n) end -- edge case for retrigger
+      if S.chord_hold_tokens[root_note] == hold_tid then
         fanout_note_on(canon, n, v)
+        emitted_this_pass[#emitted_this_pass+1] = n
       end
     end)
 
@@ -1084,31 +1084,33 @@ local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, ho
         local ds = s + j * flam_space
         local vv = util.clamp(v + j * flam_dvel, 1, 127)
         schedule(ds, function()
-          if S.chord_cycle_tokens[root_note] == cycle_tid then
-            if is_repeat_cycle then fanout_note_off(canon, n) end
+          if S.chord_hold_tokens[root_note] == hold_tid then
             fanout_note_on(canon, n, vv)
+            emitted_this_pass[#emitted_this_pass+1] = n
           end
         end)
       end
     end
   end
 
-  -- allow future cycles to schedule; also cancel safely if release cleared cycle token
+  -- PASS-END: no MIDI offs here; sustain until release
+  schedule(pass_last + 1, function()
+    if S.chord_cycle_tokens[root_note] == cycle_tid then
+      S.chord_cycle_tokens[root_note] = nil
+    end
+  end)
+
+  -- Optional repeats still work only while held
   local repeat_on = (params:get("chorder_strum_repeat") or 1) == 2
-  if repeat_on then
+  local hold_on   = param_is_on("chorder_hold_strum")
+  if repeat_on and hold_on then
+    local gap = params:get("chorder_strum_repeat_gap") or 0
     local max_cycles = params:get("chorder_strum_repeat_cycles") or 0
     local next_idx = (cycle_idx or 1) + 1
     local should_continue = (max_cycles == 0) or (next_idx <= max_cycles)
-    schedule(pass_last + 1, function()
-      if should_continue and S.chord_cycle_tokens[root_note] == cycle_tid then
+    schedule(pass_last + gap + 1, function()
+      if should_continue and S.chord_hold_tokens[root_note] == hold_tid then
         schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, hold_tid, cycle_tid, next_idx)
-      end
-    end)
-  else
-    -- clear cycle token at end of a single pass so late events don't leak
-    schedule(pass_last + 1, function()
-      if S.chord_cycle_tokens[root_note] == cycle_tid then
-        S.chord_cycle_tokens[root_note] = nil
       end
     end)
   end
@@ -1128,6 +1130,7 @@ local function handle_note_on(canon, root_note, vel, deg)
     S.last_name_time = now()
     Arp.refresh()
     Arp.chord_key(true)
+    -- token guard (mono just uses HOLD; no cycle needed)
     local tid = next_trigger_id()
     S.chord_hold_tokens[root_note] = tid
     fanout_note_on(canon, root_note, vel)
@@ -1146,7 +1149,7 @@ local function handle_note_on(canon, root_note, vel, deg)
   Arp.refresh()
   Arp.chord_key(true)
 
-  -- HOLD token (for offs) + CYCLE token (for emission/loop control)
+  -- HOLD + CYCLE tokens
   local hold_tid  = next_trigger_id()
   local cycle_tid = next_trigger_id()
   S.chord_hold_tokens[root_note]  = hold_tid
@@ -1155,14 +1158,11 @@ local function handle_note_on(canon, root_note, vel, deg)
   schedule_chord_strum_pass(canon, root_note, vel, deg, hold_tid, cycle_tid, 1)
 end
 
+-- CHANGED: always stop both MIDI and MX on key-up (chord path)
 local function handle_note_off(canon, root_note)
   Arp.chord_key(false)
-
-  -- cancel any future scheduled steps/repeats
-  S.chord_cycle_tokens[root_note] = nil
-
-  -- clear HOLD and turn off sounding notes
   S.chord_hold_tokens[root_note] = nil
+
   local notes = S.chord_active[root_note]
   if notes then
     for _,n in ipairs(notes) do fanout_note_off(canon, n) end
@@ -1176,6 +1176,7 @@ local function free_handle_note_on(L, in_note, in_vel)
   local base_play_vel = (L.velocity_mode == 1) and L.fixed_velocity or incoming
   local fcanon = S.canonical_names[L.voice_index] or ""
 
+  -- NEW: determine mono-like vs chord mode once
   local mono_like = (L.mode == 1) or (L.key_mode == 3)
   local chord_mode = not mono_like
 
@@ -1231,6 +1232,7 @@ local function free_handle_note_on(L, in_note, in_vel)
   if hold_on then hold_tid = next_trigger_id(); L.hold_tokens[in_note]  = hold_tid end
   cycle_tid = next_trigger_id(); L.cycle_tokens[in_note] = cycle_tid
 
+  local emitted_this_pass = {}
   local pass_last = 0
 
   local function emit_at(step_idx, n, v)
@@ -1239,6 +1241,7 @@ local function free_handle_note_on(L, in_note, in_vel)
     free_schedule(L, s, function()
       if (not hold_on) or (L.hold_tokens[in_note] == hold_tid) then
         Free.fanout_on(L, fcanon, n, v); if mono_like then Free.gate_for(L, n) end
+        emitted_this_pass[#emitted_this_pass+1] = n
       end
     end)
     return s
@@ -1269,6 +1272,7 @@ local function free_handle_note_on(L, in_note, in_vel)
         free_schedule(L, ds, function()
           if (not hold_on) or (L.hold_tokens[in_note] == hold_tid) then
             Free.fanout_on(L, fcanon, n, vv); if mono_like then Free.gate_for(L, n) end
+            emitted_this_pass[#emitted_this_pass+1] = n
           end
         end)
       end
@@ -1293,6 +1297,7 @@ local function free_handle_note_on(L, in_note, in_vel)
   L.last_time = util.time()
 end
 
+-- CHANGED: chord mode always turns off on key release (MX+MIDI); mono/chromatic unchanged
 local function free_handle_note_off(L, in_note)
   if L.mode == 1 or L.key_mode == 3 then
     local q = L.active_map[in_note]
@@ -1304,6 +1309,7 @@ local function free_handle_note_off(L, in_note)
     return
   end
 
+  -- chord mode: always send offs on release (MX and MIDI)
   L.hold_tokens[in_note] = nil
   local outs = L.chord_active[in_note]
   if outs then
@@ -1572,6 +1578,7 @@ end
 -- ===== PANIC overlay drawing =====
 local function draw_panic_overlay()
   if not S.panic.show then return end
+  -- translucent footer bar with message + count
   local msg = S.panic.msg or "PANIC"
   local count = S.panic.count or 1
   local line = string.format("%s  (#%d)", msg, count)
@@ -2055,9 +2062,9 @@ local function add_timing_section()
         redraw()
       end)
     end,
-    -- REMOVED: chorder_hold_strum
+    function() params:add_option("chorder_hold_strum", "hold-to-strum (Chord)", {"off","on"}, 1) end,
     function() params:add_option("chorder_strum_repeat", "repeat strum", {"off","on"}, 1) end,
-    -- REMOVED: chorder_strum_repeat_gap
+    function() params:add_number("chorder_strum_repeat_gap", "repeat gap (steps)", 0, 8, 0) end,
     function() params:add_number("chorder_strum_repeat_cycles", "repeat cycles (0=inf)", 0, 32, 0) end,
 
     div("Timing · Timing Shapes"),
@@ -2262,7 +2269,7 @@ local function add_arp_section()
 
     div("ARP · Pattern Library"),
     function()
-      local genres = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; sort=t; table.sort(t); return t end)()
+      local genres = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()
       local def = 1
       for i,n in ipairs(genres) do if n=="Basics" then def=i break end end
       params:add_option("arp_pat_genre", "genre", genres, def)
