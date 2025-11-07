@@ -9,7 +9,6 @@ local mxsamples = include "mx.samples/lib/mx.samples"
 local chordlib  = include "lib/chordlib"
 local Strum     = include "lib/strum"
 local Feel      = include "lib/feel"
-local PatternLib= include "lib/patternlib"  -- externalized ARP pattern library
 
 -- ===== config =====
 local BASE = _path.audio .. "mx.samples"
@@ -18,7 +17,7 @@ local DEFAULT_MIDI_OUT_PORT = 1
 
 -- ===== consolidated state =====
 local S = {
-  -- UI pages (Main → Free A → Free B → Arp → Chord)
+  -- UI pages (UPDATED ORDER: Main → Free A → Free B → Arp → Chord)
   PAGE_MAIN_IO = 1, PAGE_FREEA_IO = 2, PAGE_FREEB_IO = 3, PAGE_ARP = 4, PAGE_CHORD = 5, page = 1,
 
   -- cursors (for E2 select / E3 edit UI)
@@ -53,7 +52,6 @@ local S = {
   evq = {},
   trigger_seq = 0,
   chord_hold_tokens = {},
-  chord_cycle_tokens = {},   -- NEW: per-root cycle token (valid for current strum pass)
 
   -- output mode & levels
   out_mode_param = "chorder_out_mode",
@@ -76,7 +74,7 @@ local S = {
 
   arp_order_idx = 1,
 
-  -- Free Play A
+  -- Free Play A (keeps original IDs: free_*)
   freeA = {
     id_prefix = "free",    -- param id prefix
     label = "Free A",
@@ -106,13 +104,13 @@ local S = {
     midi_in_ch_param  = "free_midi_in_ch",
     mout=nil,
     -- live state
-    active_map={}, chord_active={}, hold_tokens={}, cycle_tokens={}, -- NEW: cycle_tokens
+    active_map={}, chord_active={}, hold_tokens={},
     last_name=nil, last_time=0,
     mx_vol_pct = 100,
     hold_to_strum = false,
   },
 
-  -- Free Play B
+  -- Free Play B (new; IDs: freeb_*)
   freeB = {
     id_prefix = "freeb",
     label = "Free B",
@@ -124,7 +122,7 @@ local S = {
     swing_mode=1, swing_pct=0,
     quantize=false,
     -- velocity & gate
-    velocity_mode=2, fixed_velocity=100, gate_mode=1, midi_channel=3,
+    velocity_mode=2, fixed_velocity=100, gate_mode=1, midi_channel=3,  -- DEFAULT OUT CH = 3
     -- keying
     key_mode_param = "freeb_key_mode", key_mode=1,
     -- chord build / voicing
@@ -142,15 +140,11 @@ local S = {
     midi_in_ch_param  = "freeb_midi_in_ch",
     mout=nil,
     -- live state
-    active_map={}, chord_active={}, hold_tokens={}, cycle_tokens={}, -- NEW: cycle_tokens
+    active_map={}, chord_active={}, hold_tokens={},
     last_name=nil, last_time=0,
     mx_vol_pct = 100,
     hold_to_strum = false,
   },
-
-  -- PANIC feedback state
-  panic = { show=false, last_time=0, msg="PANIC: all notes off", count=0 },
-  panic_m = nil, -- metro
 }
 
 local function next_trigger_id() S.trigger_seq = S.trigger_seq + 1; return S.trigger_seq end
@@ -273,22 +267,6 @@ local rebind_midi_in_if_needed
 local show_param
 local setup_midi_in
 
--- ===== PANIC feedback helpers =====
-local function panic_feedback(msg)
-  S.panic.count = (S.panic.count or 0) + 1
-  S.panic.msg = msg or "PANIC: all notes off"
-  S.panic.show = true
-  S.panic.last_time = now()
-  if not S.panic_m then
-    S.panic_m = metro.init(function()
-      S.panic.show = false
-      redraw()
-    end, 1.5, 1)
-  end
-  S.panic_m:start()
-  redraw()
-end
-
 -- ===== MX module =====
 local MX = (function()
   local function exists(path) local f=io.open(path,"r"); if f then f:close(); return true end; return false end
@@ -298,7 +276,7 @@ local MX = (function()
     local fpath = BASE .. "/" .. folder .. "/manifest.lua"
     if not exists(fpath) then return sanitize_name(folder) end
     local ok, ret = pcall(dofile, fpath)
-    if ok and ret and type(ret)=="table" then
+    if ok and type(ret)=="table" then
       if type(ret.name)=="string" and ret.name~="" then return sanitize_name(ret.name) end
       if ret.info and type(ret.info.name)=="string" then return sanitize_name(ret.info.name) end
       if ret.meta and type(ret.meta.name)=="string" then return sanitize_name(ret.meta.name) end
@@ -409,7 +387,6 @@ local MIDI = (function()
     end
   end
 
-  private_note_off_direct = nil
   local function build_midi_in_list()
     S.midi.in_devices = {"none"}
     S.midi.in_ports_map = { [1] = 0 }
@@ -436,13 +413,6 @@ local MIDI = (function()
     local ok, err = pcall(function() S.midi.out:note_on(n, vel, S.midi.channel) end)
     if not ok then print("MIDI OUT note_on error: "..tostring(err)) end
     active_on(n)
-  end
-
-  local function note_off_direct(note)
-    if not S.midi.out then return end
-    local n = util.clamp(note, 0, 127)
-    pcall(function() S.midi.out:note_off(n, 0, S.midi.channel) end)
-    active_off(n)
   end
 
   local function all_off()
@@ -479,7 +449,6 @@ local MIDI = (function()
     on        = note_on,
     off_all   = all_off,
     gate_for  = schedule_gate_for_note,
-    off_direct= note_off_direct, -- (used by panic/fanout)
   }
 end)()
 
@@ -487,6 +456,134 @@ end)()
 local function scale128()
   return chordlib.build_scale(S.root_midi, S.scale_name)
 end
+
+-- ===== ARP PATTERN LIBRARY =====
+local PatternLib = (function()
+  local function deg(d, oct, prob, r, rest) return { d=d, oct=oct or 0, prob=prob or 1.0, r=r or 1, rest=rest or false } end
+  local function clone(tbl) local t={}; for k,v in pairs(tbl) do t[k]=v end; return t end
+  local function up1235(name) return { name=name, steps={deg(1),deg(2),deg(3),deg(5)} } end
+  local function updown135(name) return { name=name, steps={deg(1),deg(3),deg(5),deg(3)} } end
+  local function bounce15(name) return { name=name, steps={deg(1,0),deg(5,0),deg(1,1),deg(5,0)} } end
+  local function walk1357(name) return { name=name, steps={deg(1),deg(3),deg(5),deg(7)} } end
+  local function add_oct(template, shift)
+    local t = clone(template); t.steps = {}
+    for i,s in ipairs(template.steps) do t.steps[i] = { d=s.d, oct=(s.oct or 0)+(shift or 0), prob=s.prob, r=s.r, rest=s.rest } end
+    t.name = template.name .. (shift>=0 and (" +"..shift.."O") or (" "..shift.."O")); return t
+  end
+  local function sprinkle_rests(template, every_n)
+    local t = clone(template); t.steps = {}
+    for i,s in ipairs(template.steps) do
+      local rest = (every_n>0 and (i % every_n == 0)) or false
+      t.steps[i] = { d=s.d, oct=s.oct, prob=s.prob, r=s.r, rest=rest }
+    end
+    t.name = template.name .. " · rests"; return t
+  end
+  local function probabilistic(template, p)
+    local t = clone(template); t.steps = {}
+    for i,s in ipairs(template.steps) do t.steps[i] = { d=s.d, oct=s.oct, prob=p, r=s.r, rest=s.rest } end
+    t.name = template.name .. string.format(" · p%.2f", p); return t
+  end
+  local function ratchet(template, r)
+    local t = clone(template); t.steps = {}
+    for i,s in ipairs(template.steps) do t.steps[i] = { d=s.d, oct=s.oct, prob=s.prob, r=r, rest=s.rest } end
+    t.name = template.name .. (" · x"..r); return t
+  end
+
+  local seeds = {
+    Pop = {
+      up1235("pop · up 1-2-3-5"), updown135("pop · 1-3-5-3"), bounce15("pop · bounce 1–5"),
+      walk1357("pop · 1-3-5-7"), { name="pop · 1-6-4-5", steps={deg(1),deg(6),deg(4),deg(5)} },
+      { name="pop · 1-5-6-4", steps={deg(1),deg(5),deg(6),deg(4)} },
+    },
+    Rock = {
+      { name="rock · power walk", steps={deg(1,0),deg(5,0),deg(1,1),deg(5,0)} },
+      { name="rock · 1-♭7-1-5", steps={deg(1,0),deg(7,-1),deg(1,0),deg(5,0)} },
+      { name="rock · 1-4-5 climb", steps={deg(1),deg(4),deg(5),deg(1,1)} },
+      updown135("rock · 1-3-5-3"),
+    },
+    Jazz = {
+      { name="jazz · 1-3-5-7", steps={deg(1),deg(3),deg(5),deg(7)} },
+      { name="jazz · 3-5-7-9", steps={deg(3),deg(5),deg(7,0),deg(2,1)} },
+      { name="jazz · 7-3-5-1", steps={deg(7),deg(3),deg(5),deg(1,1)} },
+      { name="jazz · 1-2-3-5", steps={deg(1),deg(2),deg(3),deg(5)} },
+    },
+    EDM = {
+      { name="edm · saw up", steps={deg(1),deg(2),deg(3),deg(4)} },
+      { name="edm · octave runner", steps={deg(1,0),deg(1,1),deg(1,0),deg(1,1)} },
+      { name="edm · gate 1-5", steps={deg(1),deg(5),deg(1),deg(5,1)} },
+      { name="edm · 1-3-5 ratchet", steps={deg(1),deg(3),deg(5),deg(3)} },
+    },
+    House = {
+      { name="house · 1-3-5-6", steps={deg(1),deg(3),deg(5),deg(6)} },
+      { name="house · 1-5-1+O-5", steps={deg(1),deg(5),deg(1,1),deg(5)} },
+      { name="house · swing up", steps={deg(1),deg(2),deg(3),deg(2)} },
+      { name="house · pluck 1-6", steps={deg(1),deg(6),deg(1),deg(6)} },
+    },
+    DnB = {
+      { name="dnb · stabs 1", steps={deg(1),deg(1),deg(5),deg(1)} },
+      { name="dnb · 1-2-♭3-5", steps={deg(1),deg(2),deg(3,0,1.0),deg(5)} },
+      { name="dnb · 5-1 bounce", steps={deg(5),deg(1),deg(5),deg(1,1)} },
+      { name="dnb · octave ping", steps={deg(1,1),deg(1,0),deg(1,1),deg(5,0)} },
+    },
+    Trap = {
+      { name="trap · 1-5-6-5", steps={deg(1),deg(5),deg(6),deg(5)} },
+      { name="trap · 1-5-1+O-7", steps={deg(1),deg(5),deg(1,1),deg(7)} },
+      { name="trap · 1-2-5-2", steps={deg(1),deg(2),deg(5),deg(2)} },
+      { name="trap · glide stairs", steps={deg(1),deg(2,1),deg(3,1),deg(5,1)} },
+    },
+    Ambient = {
+      { name="amb · 1 • rest • 5 • rest", steps={deg(1),deg(1,0,1,1,true),deg(5),deg(5,0,1,1,true)} },
+      { name="amb · 1-3 (rests)", steps={deg(1),deg(1,0,0.7,1,true),deg(3),deg(3,0,0.7,1,true)} },
+      { name="amb · 1-6-5-3", steps={deg(1),deg(6),deg(5),deg(3)} },
+      { name="amb · 1+O-5-3-2", steps={deg(1,1),deg(5),deg(3),deg(2)} },
+    }
+  }
+
+  -- Basics patterns (folded legacy "orders")
+  local function basics_patterns()
+    return {
+      { name="basics · use arp_order", basics=true, use_order=true },
+      { name="basics · up",            basics=true, legacy="up" },
+      { name="basics · down",          basics=true, legacy="down" },
+      { name="basics · up/down",       basics=true, legacy="up/down" },
+      { name="basics · down/up",       basics=true, legacy="down/up" },
+      { name="basics · random",        basics=true, legacy="random" },
+      { name="basics · center-out",    basics=true, legacy="center-out" },
+      { name="basics · outside-in",    basics=true, legacy="outside-in" },
+      { name="basics · random no-repeat first", basics=true, legacy="random no-repeat first" },
+      { name="basics · random stable ends",     basics=true, legacy="random stable ends" },
+    }
+  end
+
+  local function expand()
+    local lib = {}
+    for g,src in pairs(seeds) do
+      lib[g] = {}
+      for _,pat in ipairs(src) do
+        table.insert(lib[g], pat)
+        table.insert(lib[g], add_oct(pat, 1))
+        table.insert(lib[g], add_oct(pat, -1))
+        table.insert(lib[g], sprinkle_rests(pat, 4))
+        table.insert(lib[g], probabilistic(pat, 0.85))
+        table.insert(lib[g], ratchet(pat, 2))
+        table.insert(lib[g], ratchet(probabilistic(pat, 0.7), 3))
+      end
+      for o=-1,1 do
+        table.insert(lib[g], { name=(g.." · ladder 1→6 "..(o>=0 and "+"..o.."O" or o.."O")),
+          steps={deg(1,o),deg(2,o),deg(3,o),deg(4,o),deg(5,o),deg(6,o),deg(5,o),deg(4,o)} })
+      end
+    end
+    lib["Basics"] = basics_patterns()
+    return lib
+  end
+
+  local LIB = expand()
+  local function genres_list() local t={}; for k,_ in pairs(LIB) do t[#t+1]=k end; table.sort(t); return t end
+  local function patterns_for(genre) local t = {}; if LIB[genre] then for _,p in ipairs(LIB[genre]) do t[#t+1]=p.name end end; return (#t>0) and t or {"(none)"} end
+  local function get(genre, idx) local list = LIB[genre]; if not list or #list==0 then return nil end; idx = util.clamp(idx or 1, 1, #list); return list[idx] end
+  local function random_for(genre) local list = LIB[genre]; if not list or #list==0 then return nil end; return list[math.random(1,#list)] end
+  return { GENRES = genres_list(), NAMES_FOR = patterns_for, GET = get, RAND = random_for }
+end)()
 
 -- ===== Arp module =====
 local Arp = (function()
@@ -517,23 +614,11 @@ local Arp = (function()
   end
 
   local function setup_midi_out(param_index_in_s_midi_devices)
-    local function all_off()
-      for n,_ in pairs(A.emitted) do
-        local canon = S.canonical_names[params:get("arp_mx_voice") or 1] or ""
-        if want_midi() and A.mout then
-          local ch = params:get("arp_midi_out_ch") or 1
-          pcall(function() A.mout:note_off(util.clamp(n,0,127), 0, ch) end)
-        end
-        if want_mx() then MX.off(canon, n) end
-      end
-      A.emitted = {}
-    end
-    all_off()
-
     local real_port = S.midi.ports_map[param_index_in_s_midi_devices] or DEFAULT_MIDI_OUT_PORT
     if A.mout then A.mout.event = nil; A.mout = nil end
     A.mout = midi.connect(real_port)
     if A.mout then print("ARP MIDI OUT: "..(midi.vports[real_port].name or ("port "..real_port))) end
+    -- keep chord/free + input alive after ARP port changes
     if rebind_midi_in_if_needed then rebind_midi_in_if_needed() end
   end
 
@@ -553,10 +638,7 @@ local Arp = (function()
     end
     if want_mx() then MX.off(canon, note) end
   end
-  local function all_off()
-    for n,_ in pairs(A.emitted) do fanout_off(n) end
-    A.emitted = {}
-  end
+  local function all_off() for n,_ in pairs(A.emitted) do fanout_off(n) end; A.emitted = {} end
 
   local function scale_between(a,b, sc)
     local lo, hi = math.min(a,b), math.max(a,b)
@@ -589,6 +671,7 @@ local Arp = (function()
     A.notes_buf = buf
   end
 
+  -- map names for Basics fixed variants -> Strum indices
   local LEGACY_TO_STRUM_IDX = {
     ["up"]=1,["down"]=2,["up/down"]=3,["down/up"]=4,["random"]=5,
     ["center-out"]=6,["outside-in"]=7,
@@ -649,10 +732,13 @@ local Arp = (function()
     return best and util.clamp(best, 0, 127) or nil
   end
 
+  -- ROBUST: don't read params that don't exist yet
   local function select_pattern()
     local random_on = false
     local p = params:lookup_param("arp_pat_random_on_chord")
-    if p then random_on = (params:get("arp_pat_random_on_chord") == 2) end
+    if p then
+      random_on = (params:get("arp_pat_random_on_chord") == 2)
+    end
     local pat = (random_on and PatternLib.RAND(A.pat_genre))
                  or PatternLib.GET(A.pat_genre, A.pat_index)
     A.cur_pat = pat
@@ -735,6 +821,7 @@ local Arp = (function()
     A.step_i = A.step_i + 1
   end
 
+  private = {}
   local function run()
     A.running = true
     A.step_i  = 1
@@ -775,9 +862,9 @@ local Arp = (function()
   end
 
   local function hotplug_refresh()
-    all_off()
     local sel = params:get("arp_midi_out_dev") or 1
     setup_midi_out(sel)
+    -- ensure chord/free MIDI + input remain bound after ARP out-mode toggles
     if rebind_midi_in_if_needed then rebind_midi_in_if_needed() end
   end
 
@@ -794,8 +881,7 @@ local Arp = (function()
   return {
     start=start, stop=stop, refresh=make_material, chord_key=chord_key,
     setup_midi_out=setup_midi_out, hotplug_refresh=hotplug_refresh,
-    set_genre=set_genre_idx, set_pat=set_pat_idx, set_rand=set_rand,
-    all_off = all_off,
+    set_genre=set_genre_idx, set_pat=set_pat_idx, set_rand=set_rand
   }
 end)()
 
@@ -811,9 +897,7 @@ local function fanout_note_on(canon, note, vel)
 end
 local function fanout_note_off(canon, note)
   if want_mx()   then MX.off(canon, note) end
-  if want_midi() then
-    MIDI.off_direct(note)
-  end
+  if want_midi() then pcall(function() if S.midi.out then S.midi.out:note_off(note, 0, S.midi.channel) end end) end
 end
 
 -- ===== Free (lane-generic) =====
@@ -827,30 +911,7 @@ local Free = (function()
     return (mval==2) or (mval==3)
   end
 
-  local function free_lane_all_off(L)
-    local fcanon = S.canonical_names[L.voice_index] or ""
-    for in_note, out_note in pairs(L.active_map) do
-      if lane_want_mx(L)   then MX.off(fcanon, out_note) end
-      if lane_want_midi(L) and L.mout then
-        pcall(function() L.mout:note_off(util.clamp(out_note,0,127), 0, L.midi_channel) end)
-      end
-      L.active_map[in_note] = nil
-    end
-    for in_note, outs in pairs(L.chord_active) do
-      for _, n in ipairs(outs) do
-        if lane_want_mx(L)   then MX.off(fcanon, n) end
-        if lane_want_midi(L) and L.mout then
-          pcall(function() L.mout:note_off(util.clamp(n,0,127), 0, L.midi_channel) end)
-        end
-      end
-      L.chord_active[in_note] = nil
-    end
-    L.hold_tokens = {}
-    L.cycle_tokens = {}
-  end
-
   local function setup_lane_midi_out(L, param_index)
-    free_lane_all_off(L)
     local real_port = S.midi.ports_map[param_index] or DEFAULT_MIDI_OUT_PORT
     if L.mout then L.mout.event = nil; L.mout = nil end
     L.mout = midi.connect(real_port)
@@ -946,7 +1007,6 @@ local Free = (function()
     quantize_to_scale = quantize_to_scale,
     make_order = make_order,
     step_offs  = step_offs,
-    all_off    = free_lane_all_off,
   }
 end)()
 
@@ -976,28 +1036,13 @@ end
 
 -- ===== Panic helpers =====
 local function panic_all_outputs()
-  if Arp and Arp.stop then Arp.stop() end
-  if Arp and Arp.all_off then Arp.all_off() end
-
   if S.mx and S.mx.all_notes_off then pcall(function() S.mx:all_notes_off() end) end
-
   if S.midi and S.midi.out then
-    for n,_ in pairs(S.midi.active_notes) do
-      pcall(function() S.midi.out:note_off(n, 0, S.midi.channel) end)
-    end
+    for n,_ in pairs(S.midi.active_notes) do pcall(function() S.midi.out:note_off(n, 0, S.midi.channel) end) end
   end
   S.midi.active_notes = {}
-
-  if Free and Free.all_off then
-    Free.all_off(S.freeA)
-    Free.all_off(S.freeB)
-  else
-    S.freeA.hold_tokens, S.freeB.hold_tokens = {}, {}
-    S.freeA.cycle_tokens, S.freeB.cycle_tokens = {}, {}
-  end
-
-  S.chord_hold_tokens = {}
-  S.chord_cycle_tokens = {}
+  S.freeA.hold_tokens = {}
+  S.freeB.hold_tokens = {}
 end
 
 -- ===== Chord voice handlers =====
@@ -1024,9 +1069,7 @@ local function build_chord_and_symbol(root_note, deg)
   return notes, symbol, qual, name_root_midi
 end
 
--- ====== TOKEN-BASED STRUM PASSES (Chord) ======
--- Modified to accept HOLD + CYCLE tokens and to schedule a pass-end MIDI-only release when hold-to-strum = off.
-local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, hold_tid, cycle_tid, cycle_idx)
+local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, tid, cycle_idx, hold_guard)
   local chord = select(1, build_chord_and_symbol(root_note, deg))
   if not chord or #chord == 0 then return end
 
@@ -1047,10 +1090,7 @@ local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, ho
   local flam_space = params:get("chorder_flam_space") or 1
   local flam_dvel  = params:get("chorder_flam_vel") or -8
 
-  local hold_on    = param_is_on("chorder_hold_strum")
-  local emitted_this_pass = {}
   local pass_last = 0
-
   for k, idx in ipairs(order) do
     local n = chord[idx]
     local base = util.clamp((incoming_vel or 100)
@@ -1067,9 +1107,8 @@ local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, ho
     pass_last = math.max(pass_last, s0 + (flam_on and (flam_cnt*flam_space) or 0))
 
     schedule(s, function()
-      if S.chord_hold_tokens[root_note] == hold_tid then
+      if (not hold_guard) or (S.chord_hold_tokens[root_note] == tid) then
         fanout_note_on(canon, n, v)
-        emitted_this_pass[#emitted_this_pass+1] = n
       end
     end)
 
@@ -1078,47 +1117,23 @@ local function schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, ho
         local ds = s + j * flam_space
         local vv = util.clamp(v + j * flam_dvel, 1, 127)
         schedule(ds, function()
-          if S.chord_hold_tokens[root_note] == hold_tid then
+          if (not hold_guard) or (S.chord_hold_tokens[root_note] == tid) then
             fanout_note_on(canon, n, vv)
-            emitted_this_pass[#emitted_this_pass+1] = n
           end
         end)
       end
     end
   end
 
-  -- At pass end: if hold-to-strum is OFF, send MIDI offs for this pass but let mx.samples ring.
-  schedule(pass_last + 1, function()
-    if S.chord_cycle_tokens[root_note] == cycle_tid then
-      if not hold_on then
-        for _,nn in ipairs(emitted_this_pass) do
-          MIDI.off_direct(nn) -- MIDI gate only; do not MX.off so it rings naturally
-          if S.chord_active[root_note] then
-            for k,v in ipairs(S.chord_active[root_note]) do
-              if v == nn then table.remove(S.chord_active[root_note], k); break end
-            end
-            if #S.chord_active[root_note] == 0 then S.chord_active[root_note] = nil end
-          end
-        end
-      end
-      -- invalidate this cycle (pass complete)
-      if S.chord_cycle_tokens[root_note] == cycle_tid then
-        S.chord_cycle_tokens[root_note] = nil
-      end
-    end
-  end)
-
-  -- Repeats: only while held AND only when hold-to-strum is ON.
   local repeat_on = (params:get("chorder_strum_repeat") or 1) == 2
-  if repeat_on and hold_on then
+  if repeat_on then
     local gap = params:get("chorder_strum_repeat_gap") or 0
     local max_cycles = params:get("chorder_strum_repeat_cycles") or 0
     local next_idx = (cycle_idx or 1) + 1
     local should_continue = (max_cycles == 0) or (next_idx <= max_cycles)
     schedule(pass_last + gap + 1, function()
-      if should_continue and S.chord_hold_tokens[root_note] == hold_tid then
-        -- same cycle token keeps cycling while the key is held
-        schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, hold_tid, cycle_tid, next_idx)
+      if should_continue and S.chord_hold_tokens[root_note] == tid then
+        schedule_chord_strum_pass(canon, root_note, incoming_vel, deg, tid, next_idx, hold_guard)
       end
     end)
   end
@@ -1138,9 +1153,6 @@ local function handle_note_on(canon, root_note, vel, deg)
     S.last_name_time = now()
     Arp.refresh()
     Arp.chord_key(true)
-    -- token guard (mono just uses HOLD; no cycle needed)
-    local tid = next_trigger_id()
-    S.chord_hold_tokens[root_note] = tid
     fanout_note_on(canon, root_note, vel)
     return
   end
@@ -1157,31 +1169,21 @@ local function handle_note_on(canon, root_note, vel, deg)
   Arp.refresh()
   Arp.chord_key(true)
 
-  -- HOLD + CYCLE tokens
-  local hold_tid  = next_trigger_id()
-  local cycle_tid = next_trigger_id()
-  S.chord_hold_tokens[root_note]  = hold_tid
-  S.chord_cycle_tokens[root_note] = cycle_tid
+  local hold_on   = (params:get("chorder_hold_strum") or 1) == 2
+  local repeat_on = (params:get("chorder_strum_repeat") or 1) == 2
+  local tid = next_trigger_id()
+  if hold_on or repeat_on then S.chord_hold_tokens[root_note] = tid end
 
-  schedule_chord_strum_pass(canon, root_note, vel, deg, hold_tid, cycle_tid, 1)
+  schedule_chord_strum_pass(canon, root_note, vel, deg, tid, 1, hold_on)
 end
 
 local function handle_note_off(canon, root_note)
   Arp.chord_key(false)
-  -- always clear HOLD (blocks future note_ons)
-  S.chord_hold_tokens[root_note] = nil
-
-  local hold_on = param_is_on("chorder_hold_strum")
-  if hold_on then
-    -- classic: immediate stop
-    local notes = S.chord_active[root_note]
-    if notes then
-      for _,n in ipairs(notes) do fanout_note_off(canon, n) end
-      S.chord_active[root_note] = nil
-    end
-  else
-    -- hold-to-strum OFF: let pass-end cleanup handle MIDI offs; mx rings
-    -- do not MX.off here; cycle token will be cleared at pass end.
+  if (params:get("chorder_hold_strum") or 1) == 2 then S.chord_hold_tokens[root_note] = nil end
+  local notes = S.chord_active[root_note]
+  if notes then
+    for _,n in ipairs(notes) do fanout_note_off(canon, n) end
+    S.chord_active[root_note] = nil
   end
 end
 
@@ -1239,28 +1241,13 @@ local function free_handle_note_on(L, in_note, in_vel)
   local n_sorted = #sorted
 
   local hold_on = L.hold_to_strum or param_is_on(L.id_prefix.."_hold_strum")
-  local hold_tid, cycle_tid
-  if hold_on then hold_tid = next_trigger_id(); L.hold_tokens[in_note]  = hold_tid end
-  cycle_tid = next_trigger_id(); L.cycle_tokens[in_note] = cycle_tid
-
-  local emitted_this_pass = {}
-  local pass_last = 0
-
-  local function emit_at(step_idx, n, v)
-    local s = (offs[step_idx] or 0) + math.random(0, L.hum_steps_max or 0)
-    pass_last = math.max(pass_last, s)
-    free_schedule(L, s, function()
-      if (not hold_on) or (L.hold_tokens[in_note] == hold_tid) then
-        Free.fanout_on(L, fcanon, n, v); Free.gate_for(L, n)
-        emitted_this_pass[#emitted_this_pass+1] = n
-      end
-    end)
-    return s
-  end
+  local tid = next_trigger_id()
+  if hold_on then L.hold_tokens[in_note] = tid end
 
   local emitted = {}
   for k, idx in ipairs(ord) do
     local n = notes[idx]
+    local s = (offs[k] or 0) + math.random(0, L.hum_steps_max or 0)
     local v_base = util.clamp(base_play_vel + math.random(-(L.hum_vel_range or 0), (L.hum_vel_range or 0)), 1, 127)
     local pos_in_sorted = idx_in_sorted[n] or 1
     local v = Feel.apply_velocity(
@@ -1269,8 +1256,9 @@ local function free_handle_note_on(L, in_note, in_vel)
       L.accent or 1,
       L.accent_amt or 0
     )
-    local s = emit_at(k, n, v)
-
+    free_schedule(L, s, function()
+      if (not hold_on) or (L.hold_tokens[in_note] == tid) then Free.fanout_on(L, fcanon, n, v); Free.gate_for(L, n) end
+    end)
     local flam_on = (params:get(L.id_prefix.."_flam") or L.flam) == 2
     if flam_on then
       local flam_cnt   = params:get(L.id_prefix.."_flam_count") or L.flam_count or 0
@@ -1278,38 +1266,15 @@ local function free_handle_note_on(L, in_note, in_vel)
       local flam_dvel  = params:get(L.id_prefix.."_flam_vel") or L.flam_vel or -8
       for j=1, flam_cnt do
         local ds = s + j * flam_space
-        pass_last = math.max(pass_last, ds)
         local vv = util.clamp(v + j * flam_dvel, 1, 127)
         free_schedule(L, ds, function()
-          if (not hold_on) or (L.hold_tokens[in_note] == hold_tid) then
-            Free.fanout_on(L, fcanon, n, vv); Free.gate_for(L, n)
-            emitted_this_pass[#emitted_this_pass+1] = n
-          end
+          if (not hold_on) or (L.hold_tokens[in_note] == tid) then Free.fanout_on(L, fcanon, n, vv); Free.gate_for(L, n) end
         end)
       end
     end
-
     emitted[#emitted + 1] = n
   end
   L.chord_active[in_note] = emitted
-
-  -- PASS-END: if hold-to-strum is off, MIDI note_off this pass; mx rings
-  free_schedule(L, (pass_last or 0) + 1, function()
-    if L.cycle_tokens[in_note] == cycle_tid then
-      if not hold_on then
-        for _,nn in ipairs(emitted_this_pass) do
-          if Free.want_midi(L) and L.mout then
-            pcall(function() L.mout:note_off(util.clamp(nn,0,127), 0, L.midi_channel) end)
-          end
-          -- leave mx.samples ringing; no MX.off here
-        end
-        L.chord_active[in_note] = nil
-      end
-      if L.cycle_tokens[in_note] == cycle_tid then
-        L.cycle_tokens[in_note] = nil
-      end
-    end
-  end)
 
   local symbol = chordlib.symbol_for(notes, qual, name_root_midi, {
     chord_type=L.chord_type, sus_mode=L.sus_mode, inversion=L.inversion,
@@ -1320,8 +1285,6 @@ local function free_handle_note_on(L, in_note, in_vel)
 end
 
 local function free_handle_note_off(L, in_note)
-  local hold_on = L.hold_to_strum or param_is_on(L.id_prefix.."_hold_strum")
-
   if L.mode == 1 or L.key_mode == 3 then
     local q = L.active_map[in_note]
     if q ~= nil then
@@ -1331,19 +1294,12 @@ local function free_handle_note_off(L, in_note)
     end
     return
   end
-
-  if hold_on then
-    -- classic: immediate stop
-    L.hold_tokens[in_note] = nil
-    local outs = L.chord_active[in_note]
-    if outs then
-      local fcanon = S.canonical_names[L.voice_index] or ""
-      for _,n in ipairs(outs) do Free.fanout_off(L, fcanon, n) end
-      L.chord_active[in_note] = nil
-    end
-  else
-    -- pass-end cleanup will MIDI-off; mx rings
-    L.hold_tokens[in_note] = nil
+  if L.hold_to_strum or param_is_on(L.id_prefix.."_hold_strum") then L.hold_tokens[in_note] = nil end
+  local outs = L.chord_active[in_note]
+  if outs then
+    local fcanon = S.canonical_names[L.voice_index] or ""
+    for _,n in ipairs(outs) do Free.fanout_off(L, fcanon, n) end
+    L.chord_active[in_note] = nil
   end
 end
 
@@ -1603,18 +1559,6 @@ local function items_chord_page()
   }
 end
 
--- ===== PANIC overlay drawing =====
-local function draw_panic_overlay()
-  if not S.panic.show then return end
-  -- translucent footer bar with message + count
-  local msg = S.panic.msg or "PANIC"
-  local count = S.panic.count or 1
-  local line = string.format("%s  (#%d)", msg, count)
-  local y = 62
-  screen.level(0); screen.rect(0, y-10, 128, 12); screen.fill()
-  screen.level(15); screen.move(64, y); screen.text_center(line)
-end
-
 -- ===== Page draw =====
 local function draw_items_list(y_start, items, cursor_idx)
   local y = y_start
@@ -1671,7 +1615,6 @@ function redraw()
   elseif S.page == S.PAGE_ARP      then draw_arp_io_page()
   else                                   draw_chord_page()
   end
-  draw_panic_overlay()
   screen.update()
 end
 
@@ -1734,11 +1677,12 @@ setup_midi_in = function(param_index)
       chord_ok = (ch_sel_idx == 1) or (msg.ch == (ch_sel_idx - 1))
     end
 
+    -- FREE LANE routing by their input channels
     local freeA_ok = false
     local freeB_ok = false
     do
       local a_ch = params:get(S.freeA.midi_in_ch_param) or 2
-      local b_ch = params:get(S.freeB.midi_in_ch_param) or 2
+      local b_ch = params:get(S.freeB.midi_in_ch_param) or 2  -- change default to 3 if you want Free B input on ch3 by default
       freeA_ok = (msg.ch == a_ch)
       freeB_ok = (msg.ch == b_ch)
     end
@@ -1809,6 +1753,7 @@ local function rebuild_midi_lists()
   MIDI.build_out()
   MIDI.build_in()
 
+  -- Rebind option lists for chord/arp/free lanes
   params:hide(S.midi.in_dev_param);  params:show(S.midi.in_dev_param)
   local p_in = params:lookup_param(S.midi.in_dev_param)
   if p_in then p_in.options = S.midi.in_devices; p_in.count = #S.midi.in_devices end
@@ -1961,15 +1906,6 @@ local function add_io_section(default_midi_in_index)
     function()
       params:add_number("chorder_mx_vol_pct", "mx volume (%)", 0, 200, S.mx_vol_pct)
       params:set_action("chorder_mx_vol_pct", function(v) S.mx_vol_pct = util.clamp(math.floor(v or 100), 0, 200) end)
-    end,
-
-    div("I/O · Utilities"),
-    function()
-      params:add_trigger("chorder_panic_now", "PANIC (all notes off)")
-      params:set_action("chorder_panic_now", function()
-        panic_all_outputs()
-        panic_feedback("PANIC triggered")
-      end)
     end,
   })
 end
@@ -2155,13 +2091,7 @@ local function add_free_lane_section(L, defaults)
     div(L.label.." · Instrument & Output"),
     function()
       params:add_option(L.out_mode_param, "output", L.out_opts, 1)
-      params:set_action(L.out_mode_param, function(_)
-        if Free and Free.all_off then Free.all_off(L) end
-        panic_all_outputs()
-        rebind_midi_in_if_needed()
-        show_param(L.id_prefix.."_gate_mode", true)
-        redraw()
-      end)
+      params:set_action(L.out_mode_param, function(_) panic_all_outputs(); rebind_midi_in_if_needed(); show_param(L.id_prefix.."_gate_mode", true); redraw() end)
     end,
     function()
       params:add_option(L.id_prefix.."_mx_voice", "mx.samples", (#S.display_names>0 and S.display_names or {"(no packs)"}), 1)
@@ -2370,8 +2300,12 @@ function init()
   add_io_section(default_midi_in_index)
   add_setup_section()
   add_timing_section()
+
+  -- Free A section (defaults: IN ch=2, OUT ch=1)
   add_free_lane_section(S.freeA, { in_ch = 2, out_ch = 1 })
+  -- Free B section (defaults: IN ch=3, OUT ch=1)
   add_free_lane_section(S.freeB, { in_ch = 3, out_ch = 1 })
+
   add_arp_section()
 
   midi.add = function(dev)
@@ -2396,6 +2330,7 @@ function init()
   show_param("chorder_inversion", S.voicing ~= 11)
   show_param(S.midi.gate_param, want_midi())
 
+  -- visibility for both lanes
   for _,L in ipairs({S.freeA, S.freeB}) do
     show_param(L.id_prefix.."_vel_fixed", L.velocity_mode == 1)
     show_param(L.id_prefix.."_gate_mode", true)
@@ -2422,9 +2357,8 @@ function key(n, z)
     S.page = (S.page % 5) + 1
     redraw()
   elseif n == 3 and z == 1 then
-    -- K3: panic (with visual feedback)
+    -- K3: panic
     panic_all_outputs()
-    panic_feedback("PANIC (K3)")
   end
 end
 
