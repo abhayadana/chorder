@@ -161,10 +161,10 @@ local K = {
     "inside-out (alt)","inside-out (random)","odds↑ then evens↑","evens↑ then odds↑",
     "low-half↑ then high-half↓",
   },
-  QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"},
+  QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32", "1/48", "1/64"},
   QUANT_DIV_MAP  = {
     ["4/1"]=4/1, ["3/1"]=3/1, ["2/1"]=2/1, ["1/1"]=1/1, ["1/2"]=1/2, ["1/3"]=1/3, ["1/4"]=1/4,
-    ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32
+    ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32, ["1/48"]=1/48, ["1/64"]=1/64
   },
   WHITE_SET      = { [0]=true,[2]=true,[4]=true,[5]=true,[7]=true,[9]=true,[11]=true },
   WHITE_TO_DEG   = { [0]=1, [2]=2, [4]=3, [5]=4, [7]=5, [9]=6, [11]=7 },
@@ -173,10 +173,14 @@ local K = {
 -- === Quantize division safety ===
 local function ensure_quant_div_tables()
   if not K.QUANT_DIV_OPTS or not K.QUANT_DIV_MAP then
-    K.QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32"}
+    K.QUANT_DIV_OPTS = {
+      "4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12",
+      "1/16","1/24","1/32","1/48","1/64"
+    }
     K.QUANT_DIV_MAP  = {
       ["4/1"]=4/1, ["3/1"]=3/1, ["2/1"]=2/1, ["1/1"]=1/1, ["1/2"]=1/2, ["1/3"]=1/3, ["1/4"]=1/4,
-      ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32
+      ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32,
+      ["1/48"]=1/48, ["1/64"]=1/64
     }
   end
 end
@@ -2015,8 +2019,8 @@ local function add_timing_section()
 
     div("Timing · Strum"),
     function()
-      params:add_number("chorder_strum", "strum (steps of division)", 0, 8, S.strum_steps)
-      params:set_action("chorder_strum", function(v) S.strum_steps = util.clamp(v,0,8); redraw() end)
+      params:add_number("chorder_strum", "strum (steps of division)", 0, 32, S.strum_steps)
+      params:set_action("chorder_strum", function(v) S.strum_steps = util.clamp(v,0,32); redraw() end)
     end,
     function()
       params:add_option("chorder_strum_type", "strum type", K.STRUM_OPTS, S.strum_type)
@@ -2130,7 +2134,7 @@ local function add_free_lane_section(L, defaults)
     end,
 
     div(L.label.." · Strum"),
-    function() params:add_number(L.id_prefix.."_strum_steps", "strum (steps of division)", 0, 8, L.strum_steps); params:set_action(L.id_prefix.."_strum_steps", function(v) L.strum_steps = util.clamp(v,0,8) end) end,
+    function() params:add_number(L.id_prefix.."_strum_steps", "strum (steps of division)", 0, 32, L.strum_steps); params:set_action(L.id_prefix.."_strum_steps", function(v) L.strum_steps = util.clamp(v,0,32) end) end,
     function() params:add_option(L.id_prefix.."_strum_type", "strum type", K.STRUM_OPTS, L.strum_type)
       params:set_action(L.id_prefix.."_strum_type", function(i) L.strum_type = i end)
     end,
