@@ -1,5 +1,8 @@
--- CHORDER — a three-voice chord-based instrument
--- Author: @abhayadana (refactor pass by ChatGPT)
+-- CHORDER — a four-voice
+-- chord-based instrument
+-- Author: @abhayadana
+-- (refactor pass by ChatGPT)
+--
 -- Engine: mx.samples and/or MIDI
 
 engine.name = "MxSamples"
@@ -161,16 +164,44 @@ local K = {
     "inside-out (alt)","inside-out (random)","odds↑ then evens↑","evens↑ then odds↑",
     "low-half↑ then high-half↓",
   },
-  QUANT_DIV_OPTS = {"4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32", "1/48", "1/64"},
+
+  -- GLOBAL quantize options (used by chord/free clock grid)
+  QUANT_DIV_OPTS = {
+    "4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12",
+    "1/16","1/24","1/32","1/48","1/64"
+  },
   QUANT_DIV_MAP  = {
     ["4/1"]=4/1, ["3/1"]=3/1, ["2/1"]=2/1, ["1/1"]=1/1, ["1/2"]=1/2, ["1/3"]=1/3, ["1/4"]=1/4,
-    ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32, ["1/48"]=1/48, ["1/64"]=1/64
+    ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32,
+    ["1/48"]=1/48, ["1/64"]=1/64
   },
+
+  -- ARP-only divisions (normal + dotted + triplet)
+  ARP_DIV_OPTS = {
+    -- normal
+    "4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32","1/48","1/64",
+    -- dotted
+    "1/2.","1/4.","1/8.","1/16.","1/32.",
+    -- triplet
+    "1/2T","1/4T","1/8T","1/16T","1/32T","1/64T"
+  },
+  ARP_DIV_MAP  = {
+    -- normal
+    ["4/1"]=4/1,   ["3/1"]=3/1,   ["2/1"]=2/1,   ["1/1"]=1/1,
+    ["1/2"]=1/2,   ["1/3"]=1/3,   ["1/4"]=1/4,   ["1/6"]=1/6,
+    ["1/8"]=1/8,   ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24,
+    ["1/32"]=1/32, ["1/48"]=1/48, ["1/64"]=1/64,
+    -- dotted (base * 3/2)
+    ["1/2."]=3/4,   ["1/4."]=3/8,   ["1/8."]=3/16,  ["1/16."]=3/32, ["1/32."]=3/64,
+    -- triplets (next-bigger base * 2/3)
+    ["1/2T"]=1/3,  ["1/4T"]=1/6,  ["1/8T"]=1/12, ["1/16T"]=1/24, ["1/32T"]=1/48, ["1/64T"]=1/96,
+  },
+
   WHITE_SET      = { [0]=true,[2]=true,[4]=true,[5]=true,[7]=true,[9]=true,[11]=true },
   WHITE_TO_DEG   = { [0]=1, [2]=2, [4]=3, [5]=4, [7]=5, [9]=6, [11]=7 },
 }
 
--- === Quantize division safety ===
+-- === Quantize division safety (GLOBAL) ===
 local function ensure_quant_div_tables()
   if not K.QUANT_DIV_OPTS or not K.QUANT_DIV_MAP then
     K.QUANT_DIV_OPTS = {
@@ -181,6 +212,25 @@ local function ensure_quant_div_tables()
       ["4/1"]=4/1, ["3/1"]=3/1, ["2/1"]=2/1, ["1/1"]=1/1, ["1/2"]=1/2, ["1/3"]=1/3, ["1/4"]=1/4,
       ["1/6"]=1/6, ["1/8"]=1/8, ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24, ["1/32"]=1/32,
       ["1/48"]=1/48, ["1/64"]=1/64
+    }
+  end
+end
+
+-- === ARP division safety ===
+local function ensure_arp_div_tables()
+  if not K.ARP_DIV_OPTS or not K.ARP_DIV_MAP then
+    K.ARP_DIV_OPTS = {
+      "4/1","3/1","2/1","1/1","1/2","1/3","1/4","1/6","1/8","1/12","1/16","1/24","1/32","1/48","1/64",
+      "1/2.","1/4.","1/8.","1/16.","1/32.",
+      "1/2T","1/4T","1/8T","1/16T","1/32T","1/64T"
+    }
+    K.ARP_DIV_MAP  = {
+      ["4/1"]=4/1,   ["3/1"]=3/1,   ["2/1"]=2/1,   ["1/1"]=1/1,
+      ["1/2"]=1/2,   ["1/3"]=1/3,   ["1/4"]=1/4,   ["1/6"]=1/6,
+      ["1/8"]=1/8,   ["1/12"]=1/12, ["1/16"]=1/16, ["1/24"]=1/24,
+      ["1/32"]=1/32, ["1/48"]=1/48, ["1/64"]=1/64,
+      ["1/2."]=3/4,  ["1/4."]=3/8,  ["1/8."]=3/16, ["1/16."]=3/32, ["1/32."]=3/64,
+      ["1/2T"]=1/3,  ["1/4T"]=1/6,  ["1/8T"]=1/12, ["1/16T"]=1/24, ["1/32T"]=1/48, ["1/64T"]=1/96,
     }
   end
 end
@@ -749,9 +799,11 @@ local Arp = (function()
     if pat then print("ARP pattern: "..(pat.name or "(unnamed)")) end
   end
 
+  -- >>> ARP timing: use ARP-specific divisions (normal + dotted + triplet)
   local function step_seconds()
-    local opt = K.QUANT_DIV_OPTS[params:get("arp_div") or 7] or "1/4"
-    local div = K.QUANT_DIV_MAP[opt] or 1/4
+    local i   = params:get("arp_div") or 1
+    local opt = K.ARP_DIV_OPTS[i] or "1/4"
+    local div = K.ARP_DIV_MAP[opt] or 1/4
     return Feel.step_seconds(div, clock.get_tempo(), params:get("arp_swing_mode") or 1, params:get("arp_swing_pct") or 0, A.step_i)
   end
 
@@ -871,6 +923,8 @@ local Arp = (function()
     -- ensure chord/free MIDI + input remain bound after ARP out-mode toggles
     if rebind_midi_in_if_needed then rebind_midi_in_if_needed() end
   end
+
+  private = {}
 
   local function set_genre_idx(i)
     local genres = (function() local t={} for _,g in ipairs(PatternLib.GENRES) do t[#t+1]=g end; table.sort(t); return t end)()
@@ -1686,7 +1740,7 @@ setup_midi_in = function(param_index)
     local freeB_ok = false
     do
       local a_ch = params:get(S.freeA.midi_in_ch_param) or 2
-      local b_ch = params:get(S.freeB.midi_in_ch_param) or 2  -- change default to 3 if you want Free B input on ch3 by default
+      local b_ch = params:get(S.freeB.midi_in_ch_param) or 3
       freeA_ok = (msg.ch == a_ch)
       freeB_ok = (msg.ch == b_ch)
     end
@@ -2134,7 +2188,10 @@ local function add_free_lane_section(L, defaults)
     end,
 
     div(L.label.." · Strum"),
-    function() params:add_number(L.id_prefix.."_strum_steps", "strum (steps of division)", 0, 32, L.strum_steps); params:set_action(L.id_prefix.."_strum_steps", function(v) L.strum_steps = util.clamp(v,0,32) end) end,
+    function()
+      params:add_number(L.id_prefix.."_strum_steps", "strum (steps of division)", 0, 32, L.strum_steps)
+      params:set_action(L.id_prefix.."_strum_steps", function(v) L.strum_steps = util.clamp(v,0,32) end)
+    end,
     function() params:add_option(L.id_prefix.."_strum_type", "strum type", K.STRUM_OPTS, L.strum_type)
       params:set_action(L.id_prefix.."_strum_type", function(i) L.strum_type = i end)
     end,
@@ -2218,9 +2275,10 @@ local function add_arp_section()
 
     div("ARP · Timing"),
     function()
-      ensure_quant_div_tables()
-      local def_idx = 7
-      safe_add_option("arp_div", "division", K.QUANT_DIV_OPTS, def_idx)
+      ensure_arp_div_tables()
+      local function idx_of(tbl, val) for i,v in ipairs(tbl) do if v==val then return i end end return 1 end
+      local def_idx = idx_of(K.ARP_DIV_OPTS, "1/4")
+      safe_add_option("arp_div", "division", K.ARP_DIV_OPTS, def_idx)
     end,
     function() params:add_option("arp_swing_mode", "swing mode", {"grid","swing %"}, 1) end,
     function() params:add_number("arp_swing_pct", "swing %", 0, 75, 0) end,
